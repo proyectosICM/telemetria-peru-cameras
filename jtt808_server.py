@@ -4,8 +4,13 @@ import asyncio
 import binascii
 import json
 import logging
+import socket
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+
+# === Config comportamiento ===
+ALWAYS_ACK_UNKNOWN = True   # ACK 0x8001 también a msgId no manejados (recomendado en pruebas)
+ASK_LOCATION_AFTER_AUTH = True  # tras 0x0102, enviar 0x8201
 
 # === JT/T 808 framing/escape ===
 START_END = b'\x7e'
@@ -25,7 +30,6 @@ def de_escape(payload: bytes) -> bytes:
     return bytes(out)
 
 def do_escape(raw: bytes) -> bytes:
-    # aplica escape a 0x7E y 0x7D
     out = bytearray()
     for b in raw:
         bb = bytes([b])
@@ -43,21 +47,18 @@ def checksum(data: bytes) -> int:
 
 # === Helpers BCD/coords ===
 def bcd_to_str(b: bytes) -> str:
-    # Convierte BCD a string (e.g. phone/time)
     out = ""
     for x in b:
         out += f"{(x >> 4) & 0xF}{x & 0xF}"
     return out
 
 def parse_time_bcd6(b: bytes) -> datetime:
-    # YYMMDDhhmmss (6 bytes BCD)
-    s = bcd_to_str(b)  # e.g. "241103153012"
+    s = bcd_to_str(b)  # "YYMMDDhhmmss"
     yy = int(s[0:2])
     year = 2000 + yy if yy < 70 else 1900 + yy
     return datetime(year, int(s[2:4]), int(s[4:6]), int(s[6:8]), int(s[8:10]), int(s[10:12]))
 
 def parse_coord_u32(raw: bytes) -> float:
-    # 4 bytes unsigned int, en 1e-6 grados
     v = int.from_bytes(raw, 'big', signed=False)
     return v / 1_000_000.0
 
@@ -82,7 +83,6 @@ pos_fh = RotatingFileHandler("jtt808_pos.jsonl", maxBytes=10_000_000, backupCoun
 pos_logger.addHandler(pos_fh)
 
 # === Header 808 (2013) ===
-# msgId(2) | msgBodyProps(2) | terminalPhone(6 BCD) | flowId(2) | [subpkg(4)?]
 def parse_header(payload: bytes):
     if len(payload) < 12:
         raise ValueError("Frame demasiado corto para header 808")
@@ -90,7 +90,7 @@ def parse_header(payload: bytes):
     props = payload[2:4]
     phone = payload[4:10]       # BCD
     flow_id = payload[10:12]
-    body_len = ((props[0] & 0x03) << 8) | props[1]  # 10 bits de longitud
+    body_len = ((props[0] & 0x03) << 8) | props[1]  # 10 bits
     has_subpkg = (props[0] & 0x20) != 0
     idx = 12
     subpkg = None
@@ -113,7 +113,6 @@ def parse_header(payload: bytes):
 
 # === Build headers/responses ===
 def build_props(body_len: int, subpkg=False, encrypt=0):
-    # props: 0-9 len, 10-12 encrypt, 13 subpkg, 14-15 reserved
     val = 0
     val |= (body_len & 0x03FF)
     val |= (encrypt & 0x7) << 10
@@ -128,59 +127,60 @@ class Flow:
         self._v = (self._v + 1) & 0xFFFF
         return self._v.to_bytes(2, 'big')
 
-# Respuesta general plataforma 0x8001
+def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, body: bytes=b''):
+    header = msg_id + build_props(len(body)) + phone_bcd + flow_id_platform
+    frame = header + body
+    cs = bytes([checksum(frame)])
+    esc = do_escape(frame + cs)
+    return START_END + esc + START_END
+
+# 0x8001 – Platform general response
 def build_0x8001(phone_bcd: bytes, flow_id_platform: bytes, orig_flow_id: bytes, orig_msg_id: bytes, result: int):
     body = b'\x80\x01' + orig_flow_id + orig_msg_id + bytes([result])
-    props = build_props(len(body))
-    header = b'\x80\x01' + props + phone_bcd + flow_id_platform  # msgId=0x8001
-    frame = header + body
-    cs = bytes([checksum(frame)])
-    esc = do_escape(frame + cs)
-    return START_END + esc + START_END
+    return build_downlink(b'\x80\x01', phone_bcd, flow_id_platform, body)
 
-# Registro 0x8100
+# 0x8100 – Register response
 def build_0x8100(phone_bcd: bytes, flow_id_platform: bytes, orig_flow_id: bytes, result: int = 0, auth_code: bytes = b''):
-    # 0=éxito, 1=ya registrado, 2=no en DB, 3=IMEI existe, 4=vehículo existe
-    # body: [0x81 0x00] + flowId(2) + result(1) + authCode(n)
     body = b'\x81\x00' + orig_flow_id + bytes([result]) + auth_code
-    props = build_props(len(body))
-    header = b'\x81\x00' + props + phone_bcd + flow_id_platform  # msgId=0x8100
-    frame = header + body
-    cs = bytes([checksum(frame)])
-    esc = do_escape(frame + cs)
-    return START_END + esc + START_END
+    return build_downlink(b'\x81\x00', phone_bcd, flow_id_platform, body)
 
-# === Handlers ===
+# 0x8201 – Location information query (cuerpo vacío)
+def build_0x8201(phone_bcd: bytes, flow_id_platform: bytes):
+    return build_downlink(b'\x82\x01', phone_bcd, flow_id_platform, b'')
+
+# 0x8202 – Temporary tracking control: interval_s(2B) + validity_min(4B) (usa lo que soporte tu vendor)
+def build_0x8202(phone_bcd: bytes, flow_id_platform: bytes, interval_s: int, validity_min: int):
+    body = interval_s.to_bytes(2, 'big') + validity_min.to_bytes(4, 'big')
+    return build_downlink(b'\x82\x02', phone_bcd, flow_id_platform, body)
+
+# === Handlers uplink ===
 def handle_0002_heartbeat(session, hdr, body):
-    # responde 0 (éxito)
-    resp = build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
-    return resp
+    # Terminal heartbeat → responde ACK general
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 def handle_0100_register(session, hdr, body):
-    # Para MVP: aceptamos y devolvemos 0x8100 con result=0, sin authCode.
-    resp = build_0x8100(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], result=0, auth_code=b'')
-    return resp
+    # Registro aceptado
+    return build_0x8100(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], result=0, auth_code=b'')
 
 def handle_0102_auth(session, hdr, body):
-    # 0x0102 = autenticación
+    # Autenticación
     try:
         token = body.decode(errors='ignore') if body else ''
     except Exception:
         token = body.hex()
     logger.info(f"[0102] auth phone={hdr['phone_str']} token={token!r}")
-    # ACK general (0x8001) → éxito
+    # ACK general
     return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 def handle_0200_position(session, hdr, body):
-    # 0x0200 body mínimo:
-    #   alarm (4) | status (4) | lat(4) | lon(4) | alt(2) | speed(2) (0.1km/h) | course(2) | time(6 BCD)
+    # Posición
     try:
         alarm = int.from_bytes(body[0:4], 'big')
         status = int.from_bytes(body[4:8], 'big')
         lat = parse_coord_u32(body[8:12])
         lon = parse_coord_u32(body[12:16])
         alt = int.from_bytes(body[16:18], 'big', signed=False)
-        speed = int.from_bytes(body[18:20], 'big', signed=False) / 10.0  # 0.1 km/h
+        speed = int.from_bytes(body[18:20], 'big', signed=False) / 10.0
         course = int.from_bytes(body[20:22], 'big', signed=False)
         dt = parse_time_bcd6(body[22:28])
         item = {
@@ -199,15 +199,55 @@ def handle_0200_position(session, hdr, body):
         logger.info(f"[0200] {item}")
     except Exception as e:
         logger.exception(f"Error parseando 0x0200: {e}")
-    # 0x0200 suele requerir 0x8001 general response (éxito)
-    resp = build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
-    return resp
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
+
+def handle_0201_location_query_resp(session, hdr, body):
+    # Respuesta a 0x8201: suele traer flowId(2) seguido de una estructura similar a 0x0200
+    try:
+        if len(body) >= 2:
+            resp_flow = int.from_bytes(body[0:2], 'big')
+            rest = body[2:]
+        else:
+            resp_flow = None
+            rest = body
+        # intenta parsear como 0x0200 minimal
+        if len(rest) >= 28:
+            alarm = int.from_bytes(rest[0:4], 'big')
+            status = int.from_bytes(rest[4:8], 'big')
+            lat = parse_coord_u32(rest[8:12])
+            lon = parse_coord_u32(rest[12:16])
+            alt = int.from_bytes(rest[16:18], 'big', signed=False)
+            speed = int.from_bytes(rest[18:20], 'big', signed=False) / 10.0
+            course = int.from_bytes(rest[20:22], 'big', signed=False)
+            dt = parse_time_bcd6(rest[22:28])
+            item = {
+                "phone": hdr["phone_str"],
+                "msgId": "0x0201",
+                "resp_flow": resp_flow,
+                "alarm": alarm,
+                "status": status,
+                "lat": lat,
+                "lon": lon,
+                "alt": alt,
+                "speed_kmh": speed,
+                "course": course,
+                "time": dt.isoformat()
+            }
+            pos_logger.info(json.dumps(item, ensure_ascii=False))
+            logger.info(f"[0201] {item}")
+        else:
+            logger.info(f"[0201] resp_flow={resp_flow} body_len={len(body)} (no parseable como 0x0200)")
+    except Exception as e:
+        logger.exception(f"Error parseando 0x0201: {e}")
+    # Suele requerir ACK general
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 MSG_HANDLERS = {
-    b'\x00\x02': handle_0002_heartbeat,   # 0x0002 heartbeat
-    b'\x01\x00': handle_0100_register,    # 0x0100 registro
-    b'\x01\x02': handle_0102_auth,        # 0x0102 autenticación (NUEVO)
-    b'\x02\x00': handle_0200_position,    # 0x0200 posición
+    b'\x00\x02': handle_0002_heartbeat,     # heartbeat terminal
+    b'\x01\x00': handle_0100_register,      # registro
+    b'\x01\x02': handle_0102_auth,          # autenticación
+    b'\x02\x00': handle_0200_position,      # posición
+    b'\x02\x01': handle_0201_location_query_resp,  # respuesta a 0x8201
     # agrega aquí más: 0x0704 (lotes), 0x0801 (multimedia), etc.
 }
 
@@ -218,6 +258,21 @@ class SessionState:
         return self.flow.next()
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    # Activa TCP keepalive por conexión (evita cortes por NAT/ISP)
+    sock = writer.get_extra_info('socket')
+    if isinstance(sock, socket.socket):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Ajustes (Linux): intervalos razonables
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception as e:
+            logger.warning(f"No se pudo configurar TCP keepalive: {e}")
+
     peer = writer.get_extra_info('peername')
     logger.info(f"Conexión desde {peer}")
     session = SessionState()
@@ -263,12 +318,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             logger.info(f"→ RESP to {hdr['phone_str']} msgId=0x{hdr['msg_id'].hex()} flow={int.from_bytes(hdr['flow_id'],'big')}")
                             writer.write(resp)
                             await writer.drain()
+
+                        # Después de autenticación, pedir ubicación inmediata (0x8201)
+                        if ASK_LOCATION_AFTER_AUTH and msg_id == b'\x01\x02':
+                            cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
+                            logger.info(f"→ CMD 0x8201 Location Query to {hdr['phone_str']}")
+                            writer.write(cmd)
+                            await writer.drain()
+
                     else:
-                        # Si no hay handler, solo loguea (puedes opcionalmente responder 0x8001 aquí)
                         logger.info(f"MsgId no manejado: 0x{msg_id.hex()} phone={hdr['phone_str']} len={hdr['body_len']}")
-                        # Opcional:
-                        # resp = build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
-                        # writer.write(resp); await writer.drain()
+                        if ALWAYS_ACK_UNKNOWN:
+                            resp = build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
+                            writer.write(resp)
+                            await writer.drain()
 
                 except Exception as ex:
                     logger.exception(f"Error manejando frame: {ex}")
@@ -285,7 +348,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 async def main():
     host = "0.0.0.0"
-    port = 6808  # ajusta según tu escenario
+    port = 6808
     server = await asyncio.start_server(handle_client, host, port)
     addr = ", ".join(str(s.getsockname()) for s in server.sockets)
     logger.info(f"Servidor JT/T 808 escuchando en {addr}")
