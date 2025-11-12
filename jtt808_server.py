@@ -157,10 +157,19 @@ def handle_0002_heartbeat(session, hdr, body):
     return resp
 
 def handle_0100_register(session, hdr, body):
-    # Aquí podrías leer provinceId/cityId/makerId/terminalType/IMEI/color/plate, etc.
     # Para MVP: aceptamos y devolvemos 0x8100 con result=0, sin authCode.
     resp = build_0x8100(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], result=0, auth_code=b'')
     return resp
+
+def handle_0102_auth(session, hdr, body):
+    # 0x0102 = autenticación
+    try:
+        token = body.decode(errors='ignore') if body else ''
+    except Exception:
+        token = body.hex()
+    logger.info(f"[0102] auth phone={hdr['phone_str']} token={token!r}")
+    # ACK general (0x8001) → éxito
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 def handle_0200_position(session, hdr, body):
     # 0x0200 body mínimo:
@@ -195,16 +204,16 @@ def handle_0200_position(session, hdr, body):
     return resp
 
 MSG_HANDLERS = {
-    b'\x00\x02': handle_0002_heartbeat,
-    b'\x01\x00': handle_0100_register,
-    b'\x02\x00': handle_0200_position,
-    # agrega aquí más: 0x0102 auth, 0x0800/0x0801 multimedia, etc.
+    b'\x00\x02': handle_0002_heartbeat,   # 0x0002 heartbeat
+    b'\x01\x00': handle_0100_register,    # 0x0100 registro
+    b'\x01\x02': handle_0102_auth,        # 0x0102 autenticación (NUEVO)
+    b'\x02\x00': handle_0200_position,    # 0x0200 posición
+    # agrega aquí más: 0x0704 (lotes), 0x0801 (multimedia), etc.
 }
 
 class SessionState:
     def __init__(self):
         self.flow = Flow()
-
     def next_flow(self) -> bytes:
         return self.flow.next()
 
@@ -251,12 +260,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if handler:
                         resp = handler(session, hdr, body)
                         if resp:
+                            logger.info(f"→ RESP to {hdr['phone_str']} msgId=0x{hdr['msg_id'].hex()} flow={int.from_bytes(hdr['flow_id'],'big')}")
                             writer.write(resp)
                             await writer.drain()
                     else:
-                        # Si no hay handler, responde 0x8001 éxito (opcional) y loguea
+                        # Si no hay handler, solo loguea (puedes opcionalmente responder 0x8001 aquí)
                         logger.info(f"MsgId no manejado: 0x{msg_id.hex()} phone={hdr['phone_str']} len={hdr['body_len']}")
-                        # Podrías decidir no responder para ciertos msgId
+                        # Opcional:
                         # resp = build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
                         # writer.write(resp); await writer.drain()
 
