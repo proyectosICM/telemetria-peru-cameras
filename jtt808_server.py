@@ -15,6 +15,16 @@ START_TEMP_TRACKING_AFTER_AUTH = True  # opción A: tras 0x0102, enviar 0x8202
 TEMP_TRACK_INTERVAL_S = 10         # cada 10s
 TEMP_TRACK_DURATION_MIN = 10       # por 10 minutos
 
+# === Config de video (señalización 1078 sobre 808; el stream va a tu media-server) ===
+VIDEO_TARGET_IP = "TU.IP.PUBLICA"  # <-- cámbialo a tu IP pública o dominio
+VIDEO_TARGET_PORT = 7200           # puerto donde escucha tu jt1078_media_server (UDP/TCP)
+VIDEO_CHANNEL = 1                  # canal lógico del DVR (1..N)
+VIDEO_USE_UDP = True               # True=UDP, False=TCP
+VIDEO_MEDIA_TYPE = 2               # 0=audio+video, 1=solo audio, 2=solo video
+VIDEO_STREAM_TYPE = 1              # 0=todos, 1=main, 2=sub
+VIDEO_DATA_TYPE = 0                # 0=stream primario
+VIDEO_CODEC_CODE = 0               # 0=H.264, 1=H.265 (según vendor)
+
 # === JT/T 808 framing/escape ===
 START_END = b'\x7e'
 ESC = b'\x7d'
@@ -156,6 +166,47 @@ def build_0x8202(phone_bcd: bytes, flow_id_platform: bytes, interval_s: int, val
     body = interval_s.to_bytes(2, 'big') + validity_min.to_bytes(4, 'big')
     return build_downlink(b'\x82\x02', phone_bcd, flow_id_platform, body)
 
+# === JT/T 1078: A/V control downlinks (via enlace 808) ===
+# Layout "típico" de 0x9101:
+# [IP_len(1)] [IP(bytes)] [TCP/UDP(1)] [mediaType(1)] [channel(1)] [streamType(1)] [dataType(1)] [codec(1)] [port(2)]
+# - TCP/UDP: 0=TCP, 1=UDP
+# - mediaType: 0=audio+video, 1=audio, 2=video
+# - streamType: 0=todos, 1=main, 2=sub
+# - dataType: 0=primario
+# - codec: 0=H.264, 1=H.265 (según vendor)
+def build_0x9101(phone_bcd: bytes, flow_id_platform: bytes,
+                 ip: str, port: int, channel: int,
+                 udp: bool = True, media_type: int = 2, stream_type: int = 1,
+                 data_type: int = 0, codec_code: int = 0):
+    ip_bytes = ip.encode("ascii")
+    body = bytearray()
+    body += b'\x91\x01'
+    body.append(len(ip_bytes))
+    body += ip_bytes
+    body.append(1 if udp else 0)
+    body.append(media_type & 0xFF)
+    body.append(channel & 0xFF)
+    body.append(stream_type & 0xFF)
+    body.append(data_type & 0xFF)
+    body.append(codec_code & 0xFF)
+    body += port.to_bytes(2, 'big')
+    return build_downlink(b'\x91\x01', phone_bcd, flow_id_platform, bytes(body))
+
+# 0x9102 – control de A/V
+# [channel(1)] [control(1)] [close_audio(1)] [close_video(1)] [switch_stream(1)]
+# control: 0=stop, 1=start, 2=pause, 3=resume
+def build_0x9102(phone_bcd: bytes, flow_id_platform: bytes,
+                 channel: int, control: int = 1,
+                 close_audio: int = 0, close_video: int = 0, switch_stream: int = 0):
+    body = bytearray()
+    body += b'\x91\x02'
+    body.append(channel & 0xFF)
+    body.append(control & 0xFF)
+    body.append(close_audio & 0xFF)
+    body.append(close_video & 0xFF)
+    body.append(switch_stream & 0xFF)
+    return build_downlink(b'\x91\x02', phone_bcd, flow_id_platform, bytes(body))
+
 # === Handlers uplink ===
 def handle_0002_heartbeat(session, hdr, body):
     # Terminal heartbeat → responde ACK general
@@ -205,7 +256,7 @@ def handle_0200_position(session, hdr, body):
     return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 def handle_0201_location_query_resp(session, hdr, body):
-    # Respuesta a 0x8201: suele traer flowId(2) seguido de una estructura similar a 0x0200
+    # Respuesta a 0x8201: flowId(2) + estructura similar a 0x0200
     try:
         if len(body) >= 2:
             resp_flow = int.from_bytes(body[0:2], 'big')
@@ -319,7 +370,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             writer.write(resp)
                             await writer.drain()
 
-                        # Después de autenticación, pedir ubicación y arrancar tracking temporal (Opción A)
+                        # Después de autenticación, orquestar consultas y VIDEO
                         if msg_id == b'\x01\x02':
                             if ASK_LOCATION_AFTER_AUTH:
                                 cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
@@ -333,6 +384,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 )
                                 logger.info(f"→ CMD 0x8202 Temp Tracking to {hdr['phone_str']} ({TEMP_TRACK_INTERVAL_S}s x {TEMP_TRACK_DURATION_MIN}min)")
                                 writer.write(cmd2); await writer.drain()
+
+                            # === INICIO DE VIDEO (0x9101) ===
+                            av = build_0x9101(
+                                hdr["phone_bcd"], session.next_flow(),
+                                ip=VIDEO_TARGET_IP, port=VIDEO_TARGET_PORT, channel=VIDEO_CHANNEL,
+                                udp=VIDEO_USE_UDP, media_type=VIDEO_MEDIA_TYPE,
+                                stream_type=VIDEO_STREAM_TYPE, data_type=VIDEO_DATA_TYPE,
+                                codec_code=VIDEO_CODEC_CODE
+                            )
+                            logger.info(f"→ CMD 0x9101 Start AV ch={VIDEO_CHANNEL} to {VIDEO_TARGET_IP}:{VIDEO_TARGET_PORT} {'UDP' if VIDEO_USE_UDP else 'TCP'}")
+                            writer.write(av); await writer.drain()
+
+                            # Algunos vendors requieren 0x9102 START además de 0x9101
+                            av_ctrl = build_0x9102(hdr["phone_bcd"], session.next_flow(), channel=VIDEO_CHANNEL, control=1)
+                            logger.info(f"→ CMD 0x9102 Control START ch={VIDEO_CHANNEL}")
+                            writer.write(av_ctrl); await writer.drain()
 
                     else:
                         logger.info(f"MsgId no manejado: 0x{msg_id.hex()} phone={hdr['phone_str']} len={hdr['body_len']}")
