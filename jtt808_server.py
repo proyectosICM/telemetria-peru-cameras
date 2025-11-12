@@ -9,8 +9,11 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # === Config comportamiento ===
-ALWAYS_ACK_UNKNOWN = True   # ACK 0x8001 también a msgId no manejados (recomendado en pruebas)
-ASK_LOCATION_AFTER_AUTH = True  # tras 0x0102, enviar 0x8201
+ALWAYS_ACK_UNKNOWN = True          # ACK 0x8001 también a msgId no manejados (recomendado en pruebas)
+ASK_LOCATION_AFTER_AUTH = True     # tras 0x0102, enviar 0x8201
+START_TEMP_TRACKING_AFTER_AUTH = True  # opción A: tras 0x0102, enviar 0x8202
+TEMP_TRACK_INTERVAL_S = 10         # cada 10s
+TEMP_TRACK_DURATION_MIN = 10       # por 10 minutos
 
 # === JT/T 808 framing/escape ===
 START_END = b'\x7e'
@@ -148,7 +151,7 @@ def build_0x8100(phone_bcd: bytes, flow_id_platform: bytes, orig_flow_id: bytes,
 def build_0x8201(phone_bcd: bytes, flow_id_platform: bytes):
     return build_downlink(b'\x82\x01', phone_bcd, flow_id_platform, b'')
 
-# 0x8202 – Temporary tracking control: interval_s(2B) + validity_min(4B) (usa lo que soporte tu vendor)
+# 0x8202 – Temporary tracking control: interval_s(2B) + validity_min(4B) (revisar soporte del vendor)
 def build_0x8202(phone_bcd: bytes, flow_id_platform: bytes, interval_s: int, validity_min: int):
     body = interval_s.to_bytes(2, 'big') + validity_min.to_bytes(4, 'big')
     return build_downlink(b'\x82\x02', phone_bcd, flow_id_platform, body)
@@ -210,7 +213,6 @@ def handle_0201_location_query_resp(session, hdr, body):
         else:
             resp_flow = None
             rest = body
-        # intenta parsear como 0x0200 minimal
         if len(rest) >= 28:
             alarm = int.from_bytes(rest[0:4], 'big')
             status = int.from_bytes(rest[4:8], 'big')
@@ -239,7 +241,6 @@ def handle_0201_location_query_resp(session, hdr, body):
             logger.info(f"[0201] resp_flow={resp_flow} body_len={len(body)} (no parseable como 0x0200)")
     except Exception as e:
         logger.exception(f"Error parseando 0x0201: {e}")
-    # Suele requerir ACK general
     return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 MSG_HANDLERS = {
@@ -263,7 +264,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     if isinstance(sock, socket.socket):
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            # Ajustes (Linux): intervalos razonables
             if hasattr(socket, "TCP_KEEPIDLE"):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
             if hasattr(socket, "TCP_KEEPINTVL"):
@@ -319,12 +319,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             writer.write(resp)
                             await writer.drain()
 
-                        # Después de autenticación, pedir ubicación inmediata (0x8201)
-                        if ASK_LOCATION_AFTER_AUTH and msg_id == b'\x01\x02':
-                            cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
-                            logger.info(f"→ CMD 0x8201 Location Query to {hdr['phone_str']}")
-                            writer.write(cmd)
-                            await writer.drain()
+                        # Después de autenticación, pedir ubicación y arrancar tracking temporal (Opción A)
+                        if msg_id == b'\x01\x02':
+                            if ASK_LOCATION_AFTER_AUTH:
+                                cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
+                                logger.info(f"→ CMD 0x8201 Location Query to {hdr['phone_str']}")
+                                writer.write(cmd); await writer.drain()
+                            if START_TEMP_TRACKING_AFTER_AUTH:
+                                cmd2 = build_0x8202(
+                                    hdr["phone_bcd"], session.next_flow(),
+                                    interval_s=TEMP_TRACK_INTERVAL_S,
+                                    validity_min=TEMP_TRACK_DURATION_MIN
+                                )
+                                logger.info(f"→ CMD 0x8202 Temp Tracking to {hdr['phone_str']} ({TEMP_TRACK_INTERVAL_S}s x {TEMP_TRACK_DURATION_MIN}min)")
+                                writer.write(cmd2); await writer.drain()
 
                     else:
                         logger.info(f"MsgId no manejado: 0x{msg_id.hex()} phone={hdr['phone_str']} len={hdr['body_len']}")
@@ -337,7 +345,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     logger.exception(f"Error manejando frame: {ex}")
 
     except Exception as e:
-        logger.exception(f"Error en conexión {peer}: {e}")
+        # Silencia el traceback ruidoso cuando el peer corta
+        if isinstance(e, ConnectionResetError):
+            logger.info(f"Conexión reseteada por peer {peer}")
+        else:
+            logger.exception(f"Error en conexión {peer}: {e}")
     finally:
         try:
             writer.close()
