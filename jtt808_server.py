@@ -16,7 +16,7 @@ TEMP_TRACK_INTERVAL_S = 10         # cada 10s
 TEMP_TRACK_DURATION_MIN = 10       # por 10 minutos
 
 # === Config de video (señalización 1078 sobre 808; el stream va a tu media-server) ===
-VIDEO_TARGET_IP = "TU.IP.PUBLICA"  # <-- cámbialo a tu IP pública o dominio
+VIDEO_TARGET_IP = "38.43.134.172"  # <-- cámbialo a tu IP pública o dominio
 VIDEO_TARGET_PORT = 7200           # puerto donde escucha tu jt1078_media_server (UDP/TCP)
 VIDEO_CHANNEL = 1                  # canal lógico del DVR (1..N)
 VIDEO_USE_UDP = True               # True=UDP, False=TCP
