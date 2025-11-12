@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # jt1078_media_server.py
 import asyncio, os, struct, logging, signal, pathlib, subprocess
-import datetime, binascii, threading
+import datetime, binascii, threading, sys
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-import socketserver
 
 LOG = logging.getLogger("jt1078")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-MEDIA_ROOT = pathlib.Path("./www")      # aquí quedarán los .m3u8 y .ts
+MEDIA_ROOT = pathlib.Path("./www")      # aquí quedarán los .m3u8 y .ts por SIM_CANAL/
 PIPE_ROOT  = pathlib.Path("./pipes")    # named pipes para ffmpeg
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 PIPE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -44,7 +43,10 @@ class StreamProc:
     def ensure(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         if not self.pipe_path.exists():
-            os.mkfifo(self.pipe_path)
+            try:
+                os.mkfifo(self.pipe_path)
+            except FileExistsError:
+                pass
         if self.ff is None or self.ff.poll() is not None:
             # Si necesitas reencode, cambia -c:v copy por -c:v libx264
             cmd = [
@@ -70,6 +72,7 @@ class StreamProc:
 
     def write(self, data: bytes):
         self.ensure()
+        # abrir en modo sin buffer para named pipe
         with open(self.pipe_path, "ab", buffering=0) as f:
             f.write(data)
 
@@ -148,16 +151,43 @@ class JT1078UDP(asyncio.DatagramProtocol):
         except Exception as e:
             LOG.exception(f"Error parseando 1078 pkt de {addr}: {e}")
 
-# HTTP embebido para servir ./www en MEDIA_HTTP_PORT
+# ---------- HTTP embebido "silencioso" ----------
+class QuietHTTPServer(ThreadingHTTPServer):
+    # Evita tracebacks por clientes que cortan (Reset/Broken pipe/Timeout)
+    def handle_error(self, request, client_address):
+        exc_type, exc, tb = sys.exc_info()
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            LOG.info(f"HTTP peer closed/reset: {client_address}")
+            return
+        return super().handle_error(request, client_address)
+
 class RootedHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(MEDIA_ROOT.resolve()), **kwargs)
 
+    # Baja el ruido de logs
+    def log_message(self, format, *args):
+        try:
+            code = int(args[1])
+        except Exception:
+            code = None
+        msg = "%s - - [%s] %s" % (
+            self.address_string(),
+            self.log_date_time_string(),
+            format % args,
+        )
+        if code in (200, 206, 304, 404):
+            LOG.info(msg)
+        else:
+            LOG.warning(msg)
+
 def start_http_server():
-    httpd = ThreadingHTTPServer(("0.0.0.0", MEDIA_HTTP_PORT), RootedHandler)
+    httpd = QuietHTTPServer(("0.0.0.0", MEDIA_HTTP_PORT), RootedHandler)
+    httpd.daemon_threads = True
     LOG.info(f"HTTP sirviendo HLS en http://0.0.0.0:{MEDIA_HTTP_PORT}/")
     httpd.serve_forever()
 
+# --------------- main ----------------
 async def main():
     # 1) Levanta HTTP en hilo
     t = threading.Thread(target=start_http_server, daemon=True)
@@ -171,7 +201,7 @@ async def main():
         reuse_port=True,
     )
     LOG.info("Servidor de medios listo.")
-    LOG.info("Ejemplo de URL por canal: http://38.43.134.172:%d/000012345678_1/index.m3u8", MEDIA_HTTP_PORT)
+    LOG.info(f"Ejemplo de URL por canal: http://TU.IP.O.DOMINIO:{MEDIA_HTTP_PORT}/000012345678_1/index.m3u8")
 
     # Mantener proceso
     stop = asyncio.Future()
