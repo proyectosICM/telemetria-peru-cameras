@@ -3,7 +3,6 @@ import asyncio
 import datetime
 import binascii
 import logging
-import signal
 
 LOG = logging.getLogger("tcp_dump")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -18,15 +17,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         while True:
             data = await reader.read(65535)  # lee hasta 64KB
             if not data:
-                # conexión cerrada por el cliente
                 LOG.info(f"Cliente {addr} cerró la conexión")
                 break
 
             now = datetime.datetime.now().isoformat(timespec="seconds")
             LOG.info(f"[{now}] Recibidos {len(data)} bytes de {addr}")
-            # imprime en hex
             print(binascii.hexlify(data).decode("ascii"))
-            # si quieres también texto crudo (comenta si molesta):
+            # Si quieres ver el raw:
             # print(data)
 
     except Exception as e:
@@ -41,32 +38,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
-    loop = asyncio.get_running_loop()
-
     server = await asyncio.start_server(
         handle_client,
         host="0.0.0.0",
         port=TCP_PORT,
-        reuse_port=True,  # quita esto si tu Python no lo soporta
     )
 
     addr_list = ", ".join(str(sock.getsockname()) for sock in server.sockets)
     LOG.info(f"Escuchando TCP en {addr_list}")
 
-    stop = asyncio.Future()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(s, stop.cancel)
-
+    # Esto se queda atendiendo clientes hasta que llegue Ctrl+C
     async with server:
-        try:
-            await stop
-        except asyncio.CancelledError:
-            pass
-
-        LOG.info("Cerrando servidor TCP...")
-        server.close()
-        await server.wait_closed()
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOG.info("Servidor detenido por Ctrl+C")
