@@ -201,7 +201,7 @@ async def main():
         reuse_port=True,
     )
     LOG.info("Servidor de medios listo.")
-    LOG.info(f"Ejemplo de URL por canal: http://TU.IP.O.DOMINIO:{MEDIA_HTTP_PORT}/000012345678_1/index.m3u8")
+    LOG.info(f"Ejemplo de URL por canal: http://telemetriaperu.com:{MEDIA_HTTP_PORT}/000012345678_1/index.m3u8")
 
     # Mantener proceso
     stop = asyncio.Future()
