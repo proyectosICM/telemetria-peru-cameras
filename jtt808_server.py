@@ -163,8 +163,7 @@ def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, bod
 # 0x8001 – Platform general response
 def build_0x8001(phone_bcd: bytes, flow_id_platform: bytes,
                  orig_flow_id: bytes, orig_msg_id: bytes, result: int):
-    # Body: resp_msgId (WORD) + resp_flowId (WORD) + result(BYTE) en la norma 808,
-    # pero muchos vendors usan: msgId(WORD) + flowId(WORD) + result(BYTE).
+    # Body: resp_msgId (WORD) + resp_flowId (WORD) + result(BYTE)
     body = orig_flow_id + orig_msg_id + bytes([result])
     return build_downlink(b'\x80\x01', phone_bcd, flow_id_platform, body)
 
@@ -463,9 +462,49 @@ MSG_HANDLERS = {
 class SessionState:
     def __init__(self):
         self.flow = Flow()
+        self.video_started = False  # <--- NUEVO FLAG
 
     def next_flow(self) -> bytes:
         return self.flow.next()
+
+
+async def start_video_if_needed(session: SessionState, hdr, writer):
+    """
+    Envía 0x9101 + 0x9102 una sola vez por sesión (video_started).
+    """
+    if session.video_started:
+        return
+
+    session.video_started = True
+
+    # 0x9101 – Start AV
+    av = build_0x9101(
+        hdr["phone_bcd"], session.next_flow(),
+        ip=VIDEO_TARGET_IP,
+        tcp_port=VIDEO_TCP_PORT,
+        udp_port=VIDEO_UDP_PORT,
+        logical_channel=VIDEO_CHANNEL,
+        data_type=VIDEO_DATA_TYPE,
+        frame_type=VIDEO_FRAME_TYPE,
+    )
+    logger.info(
+        f"→ CMD 0x9101 Start AV ch={VIDEO_CHANNEL} "
+        f"to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT}"
+    )
+    writer.write(av)
+    await writer.drain()
+
+    # 0x9102 – Control START (algunos vendors lo exigen además de 0x9101)
+    av_ctrl = build_0x9102(
+        hdr["phone_bcd"], session.next_flow(),
+        logical_channel=VIDEO_CHANNEL,
+        control_cmd=1,
+        close_av_type=0,
+        switch_stream_type=VIDEO_FRAME_TYPE,
+    )
+    logger.info(f"→ CMD 0x9102 Control START ch={VIDEO_CHANNEL}")
+    writer.write(av_ctrl)
+    await writer.drain()
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -558,34 +597,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 writer.write(cmd2)
                                 await writer.drain()
 
-                            # === INICIO DE VIDEO (0x9101) ===
-                            av = build_0x9101(
-                                hdr["phone_bcd"], session.next_flow(),
-                                ip=VIDEO_TARGET_IP,
-                                tcp_port=VIDEO_TCP_PORT,
-                                udp_port=VIDEO_UDP_PORT,
-                                logical_channel=VIDEO_CHANNEL,
-                                data_type=VIDEO_DATA_TYPE,
-                                frame_type=VIDEO_FRAME_TYPE,
-                            )
-                            logger.info(
-                                f"→ CMD 0x9101 Start AV ch={VIDEO_CHANNEL} "
-                                f"to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT}"
-                            )
-                            writer.write(av)
-                            await writer.drain()
+                            # Iniciar VIDEO tras 0x0102
+                            await start_video_if_needed(session, hdr, writer)
 
-                            # Algunos vendors requieren 0x9102 START además de 0x9101
-                            av_ctrl = build_0x9102(
-                                hdr["phone_bcd"], session.next_flow(),
-                                logical_channel=VIDEO_CHANNEL,
-                                control_cmd=1,
-                                close_av_type=0,
-                                switch_stream_type=VIDEO_FRAME_TYPE,
-                            )
-                            logger.info(f"→ CMD 0x9102 Control START ch={VIDEO_CHANNEL}")
-                            writer.write(av_ctrl)
-                            await writer.drain()
+                        # Fallback: si ya está mandando 0x0200 y aún no hemos arrancado video,
+                        # disparamos el 0x9101/0x9102 aquí.
+                        if msg_id == b'\x02\x00' and not session.video_started:
+                            logger.info(f"[VIDEO] Arrancando video por 0x0200 para {hdr['phone_str']}")
+                            await start_video_if_needed(session, hdr, writer)
 
                     else:
                         logger.info(
