@@ -3,7 +3,6 @@
 
 import asyncio
 import os
-import struct
 import logging
 import signal
 import pathlib
@@ -26,7 +25,7 @@ MEDIA_UDP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (UDP)
 MEDIA_TCP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (TCP)
 MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 
-# --- 1078 header (tabla 19): magic 0x30 0x31 0x63 0x64; luego campos tipo RTP+extras
+# --- Cabecera 1078 (tabla 19): magic 0x30 0x31 0x63 0x64; luego campos tipo RTP+extras
 # [0:4]  magic
 # [4]    V/P/X/CC
 # [5]    M/PT
@@ -219,4 +218,90 @@ class JT1078TCPServer:
 
 
 # ---------- HTTP embebido "silencioso" ----------
-class QuietHTTPSe
+class QuietHTTPServer(ThreadingHTTPServer):
+    # Evita tracebacks por clientes que cortan (Reset/Broken pipe/Timeout)
+    def handle_error(self, request, client_address):
+        exc_type, exc, tb = sys.exc_info()
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            LOG.info(f"HTTP peer closed/reset: {client_address}")
+            return
+        return super().handle_error(request, client_address)
+
+
+class RootedHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(MEDIA_ROOT.resolve()), **kwargs)
+
+    # Baja el ruido de logs
+    def log_message(self, format, *args):
+        try:
+            code = int(args[1])
+        except Exception:
+            code = None
+        msg = "%s - - [%s] %s" % (
+            self.address_string(),
+            self.log_date_time_string(),
+            format % args,
+        )
+        if code in (200, 206, 304, 404):
+            LOG.info(msg)
+        else:
+            LOG.warning(msg)
+
+
+def start_http_server():
+    httpd = QuietHTTPServer(("0.0.0.0", MEDIA_HTTP_PORT), RootedHandler)
+    httpd.daemon_threads = True
+    LOG.info(f"HTTP sirviendo HLS en http://0.0.0.0:{MEDIA_HTTP_PORT}/")
+    httpd.serve_forever()
+
+
+# --------------- main ----------------
+async def main():
+    # 1) Levanta HTTP en hilo
+    t = threading.Thread(target=start_http_server, daemon=True)
+    t.start()
+
+    loop = asyncio.get_running_loop()
+    handler = JT1078Handler()
+
+    # 2) UDP para recibir video (por si el MDVR usa UDP)
+    transport_udp, protocol_udp = await loop.create_datagram_endpoint(
+        lambda: JT1078UDP(handler),
+        local_addr=("0.0.0.0", MEDIA_UDP_PORT),
+        reuse_port=True,
+    )
+
+    # 3) TCP para recibir video (lo que tu equipo probablemente está usando)
+    tcp_server = JT1078TCPServer(handler)
+    server_tcp = await asyncio.start_server(
+        tcp_server.handle_conn,
+        "0.0.0.0",
+        MEDIA_TCP_PORT,
+    )
+    tcp_addrs = ", ".join(str(s.getsockname()) for s in server_tcp.sockets)
+    LOG.info(f"JT1078 TCP escuchando en {tcp_addrs}")
+
+    LOG.info("Servidor de medios listo.")
+    LOG.info(
+        f"Ejemplo de URL por canal: "
+        f"http://telemetriaperu.com:{MEDIA_HTTP_PORT}/000012345678_1/index.m3u8"
+    )
+
+    # Mantener proceso vivo hasta señal
+    stop = asyncio.Future()
+    for s in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(s, stop.cancel)
+
+    try:
+        await stop
+    except asyncio.CancelledError:
+        pass
+
+    transport_udp.close()
+    server_tcp.close()
+    await server_tcp.wait_closed()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
