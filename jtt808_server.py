@@ -17,11 +17,11 @@ TEMP_TRACK_DURATION_MIN = 10       # por 10 minutos
 
 # === Config de video (JT/T 1078 sobre 808; el stream va a tu media-server) ===
 VIDEO_TARGET_IP     = "38.43.134.172"  # <-- cámbialo a tu IP pública o dominio
-VIDEO_TCP_PORT      = 7200            # puerto TCP para video (puede ser el mismo que UDP)
-VIDEO_UDP_PORT      = 7200            # puerto UDP donde escucha tu jt1078_media_server
-VIDEO_CHANNEL       = 1               # canal lógico del DVR (1..N)
-VIDEO_DATA_TYPE     = 1               # 0=audio+video, 1=solo video, 2=solo audio, etc. (depende vendor)
-VIDEO_FRAME_TYPE    = 0               # 0=main stream, 1=sub stream (depende vendor)
+VIDEO_TCP_PORT      = 7200             # puerto TCP para video (puede ser el mismo que UDP)
+VIDEO_UDP_PORT      = 7200             # puerto UDP donde escucha tu jt1078_media_server
+VIDEO_CHANNEL       = 1                # canal lógico del DVR (1..N)
+VIDEO_DATA_TYPE     = 1                # 0=audio+video, 1=solo video, 2=solo audio, etc. (depende vendor)
+VIDEO_FRAME_TYPE    = 0                # 0=main stream, 1=sub stream (depende vendor)
 
 # === JT/T 808 framing/escape ===
 START_END = b'\x7e'
@@ -190,15 +190,7 @@ def build_0x8202(phone_bcd: bytes, flow_id_platform: bytes,
 
 
 # === JT/T 1078: A/V control downlinks (via enlace 808) ===
-# 0x9101 – Real-time audio and video transmit request (Tabla 17 JT/T 1078)
-# Body:
-#   [0]   IP_len (BYTE)
-#   [1..] IP address (STRING)
-#   [...] TCP port (WORD)
-#   [...] UDP port (WORD)
-#   [...] Logical channel (BYTE)
-#   [...] Data type (BYTE)
-#   [...] Frame type (BYTE)
+# 0x9101 – Real-time audio and video transmit request
 def build_0x9101(phone_bcd: bytes, flow_id_platform: bytes,
                  ip: str,
                  tcp_port: int,
@@ -221,11 +213,6 @@ def build_0x9101(phone_bcd: bytes, flow_id_platform: bytes,
 
 
 # 0x9102 – Real-time AV transmit control
-# Body:
-#   [0] logical channel (BYTE)
-#   [1] control command (BYTE)
-#   [2] close AV type (WORD)
-#   [4] switch bitstream type (WORD)
 def build_0x9102(phone_bcd: bytes, flow_id_platform: bytes,
                  logical_channel: int,
                  control_cmd: int = 1,
@@ -384,6 +371,83 @@ def handle_0201_location_query_resp(session, hdr, body):
                         hdr["flow_id"], hdr["msg_id"], 0)
 
 
+def handle_0704_batch_positions(session, hdr, body):
+    """
+    0x0704 – Location Information Batch Upload
+    body:
+      count (1B)
+      type  (1B)
+      [for i in range(count)]:
+          data_len (2B)
+          data     (data_len bytes)  # igual que cuerpo 0x0200
+    """
+    try:
+        if len(body) < 4:
+            logger.warning(f"[0704] body demasiado corto: len={len(body)}")
+            return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                                hdr["flow_id"], hdr["msg_id"], 0)
+
+        count = body[0]
+        batch_type = body[1]
+        idx = 2
+
+        logger.info(f"[0704] phone={hdr['phone_str']} count={count} type={batch_type}")
+
+        for i in range(count):
+            if idx + 2 > len(body):
+                logger.warning(f"[0704] sin espacio para data_len en registro {i}")
+                break
+
+            data_len = int.from_bytes(body[idx:idx + 2], "big")
+            idx += 2
+
+            if idx + data_len > len(body):
+                logger.warning(
+                    f"[0704] data_len={data_len} excede body_len, registro {i}"
+                )
+                break
+
+            data = body[idx:idx + data_len]
+            idx += data_len
+
+            # 'data' es como el body de 0x0200
+            try:
+                alarm = int.from_bytes(data[0:4], 'big')
+                status = int.from_bytes(data[4:8], 'big')
+                lat = parse_coord_u32(data[8:12])
+                lon = parse_coord_u32(data[12:16])
+                alt = int.from_bytes(data[16:18], 'big', signed=False)
+                speed = int.from_bytes(data[18:20], 'big', signed=False) / 10.0
+                course = int.from_bytes(data[20:22], 'big', signed=False)
+                dt = parse_time_bcd6(data[22:28])
+
+                item = {
+                    "phone": hdr["phone_str"],
+                    "msgId": "0x0704",
+                    "batch_type": batch_type,
+                    "idx": i,
+                    "alarm": alarm,
+                    "status": status,
+                    "lat": lat,
+                    "lon": lon,
+                    "alt": alt,
+                    "speed_kmh": speed,
+                    "course": course,
+                    "time": dt.isoformat()
+                }
+                pos_logger.info(json.dumps(item, ensure_ascii=False))
+                logger.info(f"[0704] item[{i}] {item}")
+            except Exception as ex_item:
+                logger.exception(f"Error parseando registro {i} de 0x0704: {ex_item}")
+
+    except Exception as e:
+        logger.exception(f"Error manejando 0x0704: {e}")
+
+    # Devolver ACK general OK
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], hdr["msg_id"], 0)
+
+
 MSG_HANDLERS = {
     b'\x00\x01': handle_0001_terminal_general_resp,   # ACK general del terminal
     b'\x00\x02': handle_0002_heartbeat,              # heartbeat terminal
@@ -391,7 +455,8 @@ MSG_HANDLERS = {
     b'\x01\x02': handle_0102_auth,                   # autenticación
     b'\x02\x00': handle_0200_position,               # posición
     b'\x02\x01': handle_0201_location_query_resp,    # respuesta a 0x8201
-    # agrega aquí más: 0x0704 (lotes), 0x0801 (multimedia), etc.
+    b'\x07\x04': handle_0704_batch_positions,        # posiciones en lote
+    # agrega aquí más: 0x0801 (multimedia), etc.
 }
 
 
@@ -449,7 +514,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         logger.warning("Checksum inválido, descartando frame")
                         continue
 
-                    # payload_sin_cs = payload[:-1]
                     hdr = parse_header(payload[:-1])  # sin checksum
                     body = payload[:-1][hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]]
 
