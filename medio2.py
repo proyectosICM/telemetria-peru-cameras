@@ -57,6 +57,25 @@ def bcd6_to_str(b: bytes) -> str:
     return "".join(out)
 
 
+def extract_h264_frame(payload: bytes) -> bytes | None:
+    """
+    Busca el primer start code H.264 dentro del payload (0x00000001 o 0x000001)
+    y devuelve desde ahí. Si no encuentra ninguno, devuelve None.
+    """
+    if not payload:
+        return None
+
+    idx = payload.find(b"\x00\x00\x00\x01")
+    if idx == -1:
+        idx = payload.find(b"\x00\x00\x01")
+
+    if idx == -1:
+        # No hay start code, este frame está contaminado de cabecera 1078 o está incompleto
+        return None
+
+    return payload[idx:]
+
+
 class StreamProc:
     """ Gestiona un ffmpeg por clave (sim,chan) con input por pipe """
     def __init__(self, key: str):
@@ -185,7 +204,7 @@ class JT1078Handler:
                 # LOG.debug(f"[{sim}_{chan}] paquete audio data_type={data_type}, ignorado")
                 return
 
-            # Heurística para hallar body (payload H.264)
+            # Heurística para hallar body (payload H.264 + posible cabecera extra)
             body = None
             for body_len_off in (28, 30):
                 if len(data) >= body_len_off + 2:
@@ -201,14 +220,22 @@ class JT1078Handler:
             key = f"{sim}_{chan}"
             out = self.reasm.feed(key, subflag, body)
             if out:
+                # Aquí ya tenemos un "frame" (I o P) completo según los subpaquetes.
+                h264_frame = extract_h264_frame(out)
+                if not h264_frame:
+                    # No se encontró start code dentro del frame; mejor descartar que
+                    # mandar basura a ffmpeg, que luego da "Could not find codec parameters".
+                    LOG.debug(f"[{key}] frame sin start code, len={len(out)} -> descartado")
+                    return
+
                 sp = self.streams.get(key)
                 if sp is None:
                     sp = self.streams.setdefault(key, StreamProc(key))
-                sp.write(out)
+                sp.write(h264_frame)
 
                 # Log sencillo si es I-frame (data_type==0)
                 if data_type == 0x0:
-                    LOG.info(f"[{key}] I-frame ({len(out)} B) from {addr}")
+                    LOG.info(f"[{key}] I-frame ({len(h264_frame)} B) from {addr}")
 
         except Exception as e:
             LOG.exception(f"Error parseando 1078 pkt de {addr}: {e}")
