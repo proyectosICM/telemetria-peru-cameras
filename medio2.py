@@ -49,25 +49,6 @@ def bcd6_to_str(b: bytes) -> str:
     return "".join(out)
 
 
-def extract_h264_frame(payload: bytes) -> bytes | None:
-    """
-    Busca el primer start code H.264 dentro del payload (0x00000001 o 0x000001)
-    y devuelve desde ahí. Si no encuentra ninguno, devuelve None.
-    """
-    if not payload:
-        return None
-
-    idx = payload.find(b"\x00\x00\x00\x01")
-    if idx == -1:
-        idx = payload.find(b"\x00\x00\x01")
-
-    if idx == -1:
-        # No hay start code, este frame está contaminado de cabecera 1078 o está incompleto
-        return None
-
-    return payload[idx:]
-
-
 class StreamProc:
     """ Gestiona un ffmpeg por clave (sim,chan) con input por pipe """
     def __init__(self, key: str):
@@ -99,13 +80,15 @@ class StreamProc:
                 "-probesize", "5000000",
                 "-analyzeduration", "5000000",
 
-                # La entrada es H.264 crudo
-                "-f", "h264",
+                # IMPORTANTE: sin "-f h264", que autodetecte (PS/TS/H264/HEVC…)
                 "-i", str(self.pipe_path),
 
-                # Sólo vídeo
+                # Tomar video y audio si existe
                 "-map", "0:v:0?",
+                "-map", "0:a:0?",
+
                 "-c:v", "copy",
+                "-c:a", "aac", "-ar", "44100", "-b:a", "128k",
 
                 "-f", "hls",
                 "-hls_time", "2",
@@ -129,6 +112,7 @@ class StreamProc:
         if self.ff is None:
             # Si ffmpeg no levantó, no tiene sentido escribir en la pipe
             return
+
         # abrir en modo sin buffer para named pipe
         with open(self.pipe_path, "ab", buffering=0) as f:
             f.write(data)
@@ -204,7 +188,6 @@ class JT1078Handler:
 
             # 🔹 Sólo ignorar audio (data_type == 2). Todo lo demás lo tratamos como vídeo/útil.
             if not is_video_datatype(data_type):
-                # LOG.debug(f"[{sim}_{chan}] paquete audio data_type={data_type}, ignorado")
                 return
 
             # Leer longitud de body según la spec
@@ -228,22 +211,15 @@ class JT1078Handler:
             key = f"{sim}_{chan}"
             out = self.reasm.feed(key, subflag, body)
             if out:
-                # Aquí ya tenemos un "frame" (I o P) completo según los subpaquetes.
-                h264_frame = extract_h264_frame(out)
-                if not h264_frame:
-                    # No se encontró start code dentro del frame; mejor descartar que
-                    # mandar basura a ffmpeg, que luego da "Could not find codec parameters".
-                    LOG.debug(f"[{key}] frame sin start code, len={len(out)} -> descartado")
-                    return
-
+                # 'out' es el stream original (PS/TS/ES) reensamblado.
                 sp = self.streams.get(key)
                 if sp is None:
                     sp = self.streams.setdefault(key, StreamProc(key))
-                sp.write(h264_frame)
+                sp.write(out)
 
                 # Log sencillo si es I-frame (data_type==0)
                 if data_type == 0x0:
-                    LOG.info(f"[{key}] I-frame ({len(h264_frame)} B) from {addr}")
+                    LOG.info(f"[{key}] I-frame ({len(out)} B) from {addr}")
 
         except Exception as e:
             LOG.exception(f"Error parseando 1078 pkt de {addr}: {e}")
