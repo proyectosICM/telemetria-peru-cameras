@@ -28,6 +28,10 @@ MEDIA_UDP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (UDP)
 MEDIA_TCP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (TCP)
 MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 
+# Data types JT1078 (nibble alto de typ_sub)
+# 0 = vídeo I frame, 1 = vídeo P frame, 2 = audio, etc.
+VIDEO_DATA_TYPES = {0, 1}
+
 # --- Cabecera 1078 (tabla 19): magic 0x30 0x31 0x63 0x64; luego campos tipo RTP+extras
 # [0:4]  magic
 # [4]    V/P/X/CC
@@ -72,6 +76,8 @@ class StreamProc:
                 "-nostats",
                 "-fflags", "nobuffer",
                 "-thread_queue_size", "512",
+                # MUY IMPORTANTE: indicamos que la entrada es H.264 crudo
+                "-f", "h264",
                 "-i", str(self.pipe_path),
                 "-map", "0:v:0?",
                 "-map", "0:a:0?",
@@ -161,13 +167,19 @@ class JT1078Handler:
             data_type = (typ_sub >> 4) & 0x0F
             subflag   = typ_sub & 0x0F
 
-            # Heurística para hallar body
+            # 🔹 Solo procesar VIDEO (I / P frames)
+            if data_type not in VIDEO_DATA_TYPES:
+                # Opcional: loguear una sola vez si quieres verificar que está llegando audio.
+                # LOG.debug(f"[{sim}_{chan}] paquete no-video data_type={data_type}, ignorado")
+                return
+
+            # Heurística para hallar body (payload H.264)
             body = None
             for body_len_off in (28, 30):
                 if len(data) >= body_len_off + 2:
                     body_len = int.from_bytes(data[body_len_off:body_len_off+2], 'big')
                     body_off = body_len_off + 2
-                    if len(data) >= body_off + body_len:
+                    if len(data) >= body_off + body_len and body_len > 0:
                         body = data[body_off:body_off+body_len]
                         break
             if body is None:
