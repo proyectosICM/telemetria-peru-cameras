@@ -4,7 +4,6 @@
 import asyncio
 import os
 import logging
-import signal
 import pathlib
 import subprocess
 import binascii
@@ -28,6 +27,10 @@ MEDIA_UDP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (UDP)
 MEDIA_TCP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (TCP)
 MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 
+# Offsets según documentación JT1078
+DATA_BODY_LEN_OFFSET = 28   # 2 bytes
+DATA_BODY_OFFSET     = 30   # inicio del body
+
 # Data types JT1078 (nibble alto de typ_sub)
 # Muchos vendors usan:
 # 0 = I-frame vídeo
@@ -37,17 +40,6 @@ MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 # Para no perder SPS/PPS, aceptamos todo menos audio.
 def is_video_datatype(dt: int) -> bool:
     return dt != 2  # sólo excluir audio
-
-
-# --- Cabecera 1078 (tabla 19): magic 0x30 0x31 0x63 0x64; luego campos tipo RTP+extras
-# [0:4]  magic
-# [4]    V/P/X/CC
-# [5]    M/PT
-# [6:8]  SN (WORD)
-# [8:14] SIM (BCD[6])
-# [14]   logical_channel (BYTE)
-# [15]   nibble alto: data_type (I/P/B/Audio/TransData); nibble bajo: subpkg (first/last/mid/original)
-# ... (campos opcionales) ... | bodyLen(2) | body[n]
 
 
 def bcd6_to_str(b: bytes) -> str:
@@ -143,28 +135,39 @@ class StreamProc:
 
 
 class Reassembler:
-    """ Ensambla por subpaquetes (first/mid/last). Si no hay subpack, pasa directo. """
+    """
+    Ensambla por subpaquetes (first/mid/last) según la spec:
+
+      subflag (SubpackageType):
+        0 = paquete completo (no fragmentado)
+        1 = primer subpaquete
+        2 = subpaquete intermedio
+        3 = último subpaquete
+    """
     def __init__(self):
         self.buffers = {}  # key -> bytearray
 
     def feed(self, key: str, subflag: int, payload: bytes):
-        # subflag: 0=original, 1=first, 2=last, 3=middle
+        # 0 = paquete completo
         if subflag == 0:
             return payload
+
         buf = self.buffers.setdefault(key, bytearray())
+
         if subflag == 1:     # first
             buf.clear()
             buf += payload
             return None
-        elif subflag == 3:   # middle
+        elif subflag == 2:   # middle
             buf += payload
             return None
-        elif subflag == 2:   # last
+        elif subflag == 3:   # last
             buf += payload
             out = bytes(buf)
             buf.clear()
             return out
         else:
+            # valor desconocido, devolvemos tal cual
             return payload
 
 
@@ -179,7 +182,7 @@ class JT1078Handler:
 
     def process_packet(self, data: bytes, addr):
         try:
-            if len(data) < 32:
+            if len(data) < DATA_BODY_OFFSET:
                 # demasiado corto para ser 1078
                 return
 
@@ -204,18 +207,23 @@ class JT1078Handler:
                 # LOG.debug(f"[{sim}_{chan}] paquete audio data_type={data_type}, ignorado")
                 return
 
-            # Heurística para hallar body (payload H.264 + posible cabecera extra)
-            body = None
-            for body_len_off in (28, 30):
-                if len(data) >= body_len_off + 2:
-                    body_len = int.from_bytes(data[body_len_off:body_len_off+2], 'big')
-                    body_off = body_len_off + 2
-                    if len(data) >= body_off + body_len and body_len > 0:
-                        body = data[body_off:body_off+body_len]
-                        break
-            if body is None:
-                # fallback grosero
-                body = data[30:]
+            # Leer longitud de body según la spec
+            if len(data) < DATA_BODY_LEN_OFFSET + 2:
+                return
+
+            body_len = int.from_bytes(
+                data[DATA_BODY_LEN_OFFSET:DATA_BODY_LEN_OFFSET + 2], "big"
+            )
+            body_off = DATA_BODY_OFFSET
+
+            if body_len <= 0 or len(data) < body_off + body_len:
+                # Paquete mal formado o truncado
+                LOG.debug(
+                    f"[{sim}_{chan}] body_len inválido ({body_len}) o paquete corto len={len(data)}"
+                )
+                return
+
+            body = data[body_off:body_off + body_len]
 
             key = f"{sim}_{chan}"
             out = self.reasm.feed(key, subflag, body)
