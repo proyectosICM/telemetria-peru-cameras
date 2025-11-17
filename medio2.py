@@ -58,14 +58,20 @@ class StreamProc:
         self.ff = None
 
     def ensure(self):
-        # Crear carpeta de salida y pipe si no existen
+        # Crear carpeta de salida
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        if not self.pipe_path.exists():
+
+        # Recrear siempre el FIFO limpio
+        if self.pipe_path.exists():
             try:
-                os.mkfifo(self.pipe_path)
-                LOG.info(f"[{self.key}] Creado named pipe {self.pipe_path}")
-            except FileExistsError:
+                os.remove(self.pipe_path)
+            except FileNotFoundError:
                 pass
+        try:
+            os.mkfifo(self.pipe_path)
+            LOG.info(f"[{self.key}] Creado named pipe {self.pipe_path}")
+        except FileExistsError:
+            pass
 
         # Levantar ffmpeg si no está corriendo
         if self.ff is None or self.ff.poll() is not None:
@@ -76,17 +82,15 @@ class StreamProc:
                 "-fflags", "nobuffer",
                 "-thread_queue_size", "512",
 
-                # Darle más margen para detectar el stream
+                # Le damos margen pero marcamos explícitamente que es H.264 raw
                 "-probesize", "5000000",
                 "-analyzeduration", "5000000",
-
-                # Dejamos que ffmpeg autodetecte (h264 raw / PS / TS...)
+                "-f", "h264",          # 👈 fuerza formato de entrada
                 "-i", str(self.pipe_path),
 
-                # Tomar sólo vídeo por ahora (sin audio para simplificar)
+                # Sólo vídeo, sin audio por ahora
                 "-map", "0:v:0?",
                 "-an",
-
                 "-c:v", "copy",
 
                 "-f", "hls",
@@ -107,9 +111,10 @@ class StreamProc:
                 self.ff = None
 
     def write(self, data: bytes):
-        self.ensure()
+        # ffmpeg se arranca en ensure(); si no levantó no escribimos
+        if self.ff is None or self.ff.poll() is not None:
+            self.ensure()
         if self.ff is None:
-            # Si ffmpeg no levantó, no tiene sentido escribir en la pipe
             return
 
         try:
@@ -195,11 +200,11 @@ class JT1078Handler:
             data_type = (typ_sub >> 4) & 0x0F
             subflag   = typ_sub & 0x0F
 
-            # 🔹 Sólo ignorar audio (data_type == 2). Todo lo demás lo tratamos como vídeo/útil.
+            # Sólo ignorar audio (data_type == 2)
             if not is_video_datatype(data_type):
                 return
 
-            # Leer longitud de body según la spec
+            # Leer longitud de body
             if len(data) < DATA_BODY_LEN_OFFSET + 2:
                 return
 
@@ -209,7 +214,6 @@ class JT1078Handler:
             body_off = DATA_BODY_OFFSET
 
             if body_len <= 0 or len(data) < body_off + body_len:
-                # Paquete mal formado o truncado
                 LOG.debug(
                     f"[{sim}_{chan}] body_len inválido ({body_len}) o paquete corto len={len(data)}"
                 )
@@ -220,7 +224,7 @@ class JT1078Handler:
             key = f"{sim}_{chan}"
             out = self.reasm.feed(key, subflag, body)
             if out:
-                # Depuración opcional: volcar un frame bruto a disco para poder hacer ffprobe.
+                # Volcar sólo el primer frame bruto a disco para depuración
                 if key not in self.dumped_debug:
                     debug_path = MEDIA_ROOT / f"debug_{key}.bin"
                     with open(debug_path, "wb") as dbg:
@@ -228,7 +232,8 @@ class JT1078Handler:
                     LOG.info(f"[{key}] Frame de depuración volcado a {debug_path}")
                     self.dumped_debug.add(key)
 
-                # 'out' es el “frame” reensamblado tal cual (H.264 raw / PS / TS).
+                # 'out' es el frame JT1078 reensamblado.
+                # Ya vimos por ffprobe que se interpreta como H.264 raw.
                 sp = self.streams.get(key)
                 if sp is None:
                     sp = self.streams.setdefault(key, StreamProc(key))
