@@ -49,6 +49,25 @@ def bcd6_to_str(b: bytes) -> str:
     return "".join(out)
 
 
+def extract_h264_frame(payload: bytes) -> bytes | None:
+    """
+    Busca el primer start code H.264 dentro del payload (0x00000001 o 0x000001)
+    y devuelve desde ahí. Si no encuentra ninguno, devuelve None.
+    """
+    if not payload:
+        return None
+
+    idx = payload.find(b"\x00\x00\x00\x01")
+    if idx == -1:
+        idx = payload.find(b"\x00\x00\x01")
+
+    if idx == -1:
+        # No hay start code, este frame está contaminado de cabecera 1078 o está incompleto
+        return None
+
+    return payload[idx:]
+
+
 class StreamProc:
     """ Gestiona un ffmpeg por clave (sim,chan) con input por pipe """
     def __init__(self, key: str):
@@ -80,10 +99,11 @@ class StreamProc:
                 "-probesize", "5000000",
                 "-analyzeduration", "5000000",
 
-                # IMPORTANTE: sin "-f h264", que autodetecte (PS/TS/H264/HEVC…)
+                # **Ahora sí** decimos que la entrada es H.264 crudo
+                "-f", "h264",
                 "-i", str(self.pipe_path),
 
-                # Tomar video y audio si existe
+                # Tomar video y audio si existe (audio casi seguro no habrá ya)
                 "-map", "0:v:0?",
                 "-map", "0:a:0?",
 
@@ -113,9 +133,18 @@ class StreamProc:
             # Si ffmpeg no levantó, no tiene sentido escribir en la pipe
             return
 
-        # abrir en modo sin buffer para named pipe
-        with open(self.pipe_path, "ab", buffering=0) as f:
-            f.write(data)
+        try:
+            # abrir en modo sin buffer para named pipe
+            with open(self.pipe_path, "ab", buffering=0) as f:
+                f.write(data)
+        except BrokenPipeError:
+            LOG.error(f"[{self.key}] Broken pipe escribiendo a {self.pipe_path}, reiniciando ffmpeg")
+            # Reiniciar ffmpeg en el siguiente frame
+            self.ff = None
+            try:
+                os.remove(self.pipe_path)
+            except FileNotFoundError:
+                pass
 
 
 class Reassembler:
@@ -163,6 +192,7 @@ class JT1078Handler:
     def __init__(self):
         self.streams = {}       # key -> StreamProc
         self.reasm   = Reassembler()
+        self.dumped_debug = set()  # para volcar un frame de depuración opcional
 
     def process_packet(self, data: bytes, addr):
         try:
@@ -211,15 +241,28 @@ class JT1078Handler:
             key = f"{sim}_{chan}"
             out = self.reasm.feed(key, subflag, body)
             if out:
-                # 'out' es el stream original (PS/TS/ES) reensamblado.
+                # Depuración opcional: volcar un frame bruto a disco para poder hacer ffprobe.
+                if key not in self.dumped_debug:
+                    debug_path = MEDIA_ROOT / f"debug_{key}.bin"
+                    with open(debug_path, "wb") as dbg:
+                        dbg.write(out)
+                    LOG.info(f"[{key}] Frame de depuración volcado a {debug_path}")
+                    self.dumped_debug.add(key)
+
+                # 'out' es el “frame” reensamblado. Extraemos la parte H.264 pura.
+                h264_frame = extract_h264_frame(out)
+                if not h264_frame:
+                    LOG.debug(f"[{key}] frame sin start code, len={len(out)} -> descartado")
+                    return
+
                 sp = self.streams.get(key)
                 if sp is None:
                     sp = self.streams.setdefault(key, StreamProc(key))
-                sp.write(out)
+                sp.write(h264_frame)
 
                 # Log sencillo si es I-frame (data_type==0)
                 if data_type == 0x0:
-                    LOG.info(f"[{key}] I-frame ({len(out)} B) from {addr}")
+                    LOG.info(f"[{key}] I-frame ({len(h264_frame)} B) from {addr}")
 
         except Exception as e:
             LOG.exception(f"Error parseando 1078 pkt de {addr}: {e}")
