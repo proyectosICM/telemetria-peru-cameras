@@ -319,26 +319,25 @@ async def main():
     tcp_addrs = ", ".join(str(s.getsockname()) for s in server_tcp.sockets)
     LOG.info(f"JT1078 TCP escuchando en {tcp_addrs}")
 
-    LOG.info("Servidor de medios listo.")
+    LOG.info("Servidor de medios listo. Presiona Ctrl+C para detener.")
     LOG.info(
         f"Ejemplo de URL por canal: "
         f"http://telemetriaperu.com:{MEDIA_HTTP_PORT}/000012345678_1/index.m3u8"
     )
 
-    # Mantener proceso vivo hasta señal
-    stop = asyncio.Future()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(s, stop.cancel)
-
     try:
-        await stop
-    except asyncio.CancelledError:
-        pass
-
-    transport_udp.close()
-    server_tcp.close()
-    await server_tcp.wait_closed()
+        # Tarea que nunca termina, hasta que el loop se cancele (Ctrl+C)
+        await asyncio.Future()
+    finally:
+        LOG.info("Cerrando sockets JT1078...")
+        transport_udp.close()
+        server_tcp.close()
+        await server_tcp.wait_closed()
+        LOG.info("Servidor de medios cerrado.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOG.info("Servidor detenido por teclado (Ctrl+C)")
