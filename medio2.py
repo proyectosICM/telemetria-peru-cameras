@@ -29,8 +29,15 @@ MEDIA_TCP_PORT  = 7200   # donde el MDVR puede enviar paquetes JT1078 (TCP)
 MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 
 # Data types JT1078 (nibble alto de typ_sub)
-# 0 = vídeo I frame, 1 = vídeo P frame, 2 = audio, etc.
-VIDEO_DATA_TYPES = {0, 1}
+# Muchos vendors usan:
+# 0 = I-frame vídeo
+# 1 = P-frame vídeo
+# 2 = audio
+# 3,4,... = otros tipos de vídeo / metadata
+# Para no perder SPS/PPS, aceptamos todo menos audio.
+def is_video_datatype(dt: int) -> bool:
+    return dt != 2  # sólo excluir audio
+
 
 # --- Cabecera 1078 (tabla 19): magic 0x30 0x31 0x63 0x64; luego campos tipo RTP+extras
 # [0:4]  magic
@@ -76,13 +83,19 @@ class StreamProc:
                 "-nostats",
                 "-fflags", "nobuffer",
                 "-thread_queue_size", "512",
-                # MUY IMPORTANTE: indicamos que la entrada es H.264 crudo
+
+                # Darle más margen para detectar el stream
+                "-probesize", "5000000",
+                "-analyzeduration", "5000000",
+
+                # La entrada es H.264 crudo
                 "-f", "h264",
                 "-i", str(self.pipe_path),
+
+                # Sólo vídeo
                 "-map", "0:v:0?",
-                "-map", "0:a:0?",
                 "-c:v", "copy",
-                "-c:a", "aac", "-ar", "44100", "-b:a", "128k",
+
                 "-f", "hls",
                 "-hls_time", "2",
                 "-hls_list_size", "10",
@@ -167,10 +180,9 @@ class JT1078Handler:
             data_type = (typ_sub >> 4) & 0x0F
             subflag   = typ_sub & 0x0F
 
-            # 🔹 Solo procesar VIDEO (I / P frames)
-            if data_type not in VIDEO_DATA_TYPES:
-                # Opcional: loguear una sola vez si quieres verificar que está llegando audio.
-                # LOG.debug(f"[{sim}_{chan}] paquete no-video data_type={data_type}, ignorado")
+            # 🔹 Sólo ignorar audio (data_type == 2). Todo lo demás lo tratamos como vídeo/útil.
+            if not is_video_datatype(data_type):
+                # LOG.debug(f"[{sim}_{chan}] paquete audio data_type={data_type}, ignorado")
                 return
 
             # Heurística para hallar body (payload H.264)
