@@ -49,25 +49,6 @@ def bcd6_to_str(b: bytes) -> str:
     return "".join(out)
 
 
-def extract_h264_frame(payload: bytes) -> bytes | None:
-    """
-    Busca el primer start code H.264 dentro del payload (0x00000001 o 0x000001)
-    y devuelve desde ahí. Si no encuentra ninguno, devuelve None.
-    """
-    if not payload:
-        return None
-
-    idx = payload.find(b"\x00\x00\x00\x01")
-    if idx == -1:
-        idx = payload.find(b"\x00\x00\x01")
-
-    if idx == -1:
-        # No hay start code, este frame está contaminado de cabecera 1078 o está incompleto
-        return None
-
-    return payload[idx:]
-
-
 class StreamProc:
     """ Gestiona un ffmpeg por clave (sim,chan) con input por pipe """
     def __init__(self, key: str):
@@ -90,7 +71,7 @@ class StreamProc:
         if self.ff is None or self.ff.poll() is not None:
             cmd = [
                 FFMPEG_BIN,
-                "-hide_banner", "-loglevel", "warning",
+                "-hide_banner", "-loglevel", "info",
                 "-nostats",
                 "-fflags", "nobuffer",
                 "-thread_queue_size", "512",
@@ -99,16 +80,14 @@ class StreamProc:
                 "-probesize", "5000000",
                 "-analyzeduration", "5000000",
 
-                # **Ahora sí** decimos que la entrada es H.264 crudo
-                "-f", "h264",
+                # Dejamos que ffmpeg autodetecte (h264 raw / PS / TS...)
                 "-i", str(self.pipe_path),
 
-                # Tomar video y audio si existe (audio casi seguro no habrá ya)
+                # Tomar sólo vídeo por ahora (sin audio para simplificar)
                 "-map", "0:v:0?",
-                "-map", "0:a:0?",
+                "-an",
 
                 "-c:v", "copy",
-                "-c:a", "aac", "-ar", "44100", "-b:a", "128k",
 
                 "-f", "hls",
                 "-hls_time", "2",
@@ -249,20 +228,15 @@ class JT1078Handler:
                     LOG.info(f"[{key}] Frame de depuración volcado a {debug_path}")
                     self.dumped_debug.add(key)
 
-                # 'out' es el “frame” reensamblado. Extraemos la parte H.264 pura.
-                h264_frame = extract_h264_frame(out)
-                if not h264_frame:
-                    LOG.debug(f"[{key}] frame sin start code, len={len(out)} -> descartado")
-                    return
-
+                # 'out' es el “frame” reensamblado tal cual (H.264 raw / PS / TS).
                 sp = self.streams.get(key)
                 if sp is None:
                     sp = self.streams.setdefault(key, StreamProc(key))
-                sp.write(h264_frame)
+                sp.write(out)
 
                 # Log sencillo si es I-frame (data_type==0)
                 if data_type == 0x0:
-                    LOG.info(f"[{key}] I-frame ({len(h264_frame)} B) from {addr}")
+                    LOG.info(f"[{key}] I-frame ({len(out)} B) from {addr}")
 
         except Exception as e:
             LOG.exception(f"Error parseando 1078 pkt de {addr}: {e}")
