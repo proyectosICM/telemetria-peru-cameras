@@ -142,7 +142,9 @@ class StreamProc:
                 FFMPEG_BIN,
                 "-hide_banner", "-loglevel", "info",
                 "-nostats",
-                "-fflags", "nobuffer",
+
+                # Que ffmpeg genere PTS limpios y use bajo buffer
+                "-fflags", "+genpts+nobuffer",
                 "-thread_queue_size", "512",
 
                 "-probesize", "5000000",
@@ -156,6 +158,9 @@ class StreamProc:
                 "-map", "0:v:0?",
                 "-an",
                 "-c:v", "copy",
+
+                # No intentes duplicar/dropear frames
+                "-vsync", "0",
 
                 "-f", "hls",
                 "-hls_time", "2",
