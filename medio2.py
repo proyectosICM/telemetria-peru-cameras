@@ -71,41 +71,11 @@ MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 DATA_BODY_LEN_OFFSET = 28   # 2 bytes
 DATA_BODY_OFFSET     = 30   # inicio del body
 
-# Data types JT1078 (nibble alto de typ_sub)
-# 0 = I-frame vídeo
-# 1 = P-frame vídeo
-# 2 = audio
-# 3,4,... = otros tipos de vídeo / metadata
-def is_video_datatype(dt: int) -> bool:
-    # sólo excluir audio
-    return dt != 2
-
-
 def bcd6_to_str(b: bytes) -> str:
     out = []
     for x in b:
         out.append(f"{(x >> 4) & 0xF}{x & 0xF}")
     return "".join(out)
-
-
-def extract_h264_frame(payload: bytes) -> bytes | None:
-    """
-    Busca el primer start code H.264 dentro del payload (0x00000001 o 0x000001)
-    y devuelve desde ahí. Si no encuentra ninguno, devuelve None.
-    Esto limpia la cabecera propia de JT1078 y deja solo H.264 Annex-B.
-    """
-    if not payload:
-        return None
-
-    idx = payload.find(b"\x00\x00\x00\x01")
-    if idx == -1:
-        idx = payload.find(b"\x00\x00\x01")
-
-    if idx == -1:
-        # No hay start code, este frame está contaminado o incompleto
-        return None
-
-    return payload[idx:]
 
 
 class StreamProc:
@@ -150,8 +120,7 @@ class StreamProc:
                 "-probesize", "5000000",
                 "-analyzeduration", "5000000",
 
-                # Forzamos formato de entrada como H.264 crudo
-                "-f", "h264",
+                # OJO: NO forzamos formato (-f) para que ffmpeg detecte PS/TS/H264
                 "-i", str(self.pipe_path),
 
                 # Sólo vídeo
@@ -291,9 +260,8 @@ class JT1078Handler:
             data_type = (typ_sub >> 4) & 0x0F
             subflag   = typ_sub & 0x0F
 
-            # ignorar audio
-            if not is_video_datatype(data_type):
-                return
+            # IMPORTANTE: ya NO filtramos por data_type, mandamos todo
+            # porque algunos vendors meten SPS/PPS o PS en "tipos raros".
 
             if len(data) < DATA_BODY_LEN_OFFSET + 2:
                 return
@@ -322,19 +290,14 @@ class JT1078Handler:
                     LOG.info(f"[{key}] Frame de depuración volcado a {debug_path}")
                     self.dumped_debug.add(key)
 
-                # Extraer únicamente la parte H.264 pura (desde el primer start code)
-                h264_frame = extract_h264_frame(out)
-                if not h264_frame:
-                    LOG.debug(f"[{key}] frame sin start code válido, len={len(out)} -> descartado")
-                    return
-
                 sp = self.streams.get(key)
                 if sp is None:
                     sp = self.streams.setdefault(key, StreamProc(key))
-                sp.write(h264_frame)
+                sp.write(out)
 
+                # data_type == 0 suele ser I-frame, lo dejamos solo como info
                 if data_type == 0x0:
-                    LOG.info(f"[{key}] I-frame ({len(h264_frame)} B) from {addr}")
+                    LOG.info(f"[{key}] I-frame chunk ({len(out)} B) from {addr}")
 
         except Exception as e:
             LOG.exception(f"Error parseando 1078 pkt de {addr}: {e}")
