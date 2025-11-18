@@ -71,6 +71,7 @@ MEDIA_HTTP_PORT = 2000   # donde exponemos HLS (HTTP)
 DATA_BODY_LEN_OFFSET = 28   # 2 bytes
 DATA_BODY_OFFSET     = 30   # inicio del body
 
+
 def bcd6_to_str(b: bytes) -> str:
     out = []
     for x in b:
@@ -110,26 +111,32 @@ class StreamProc:
         if self.ff is None or self.ff.poll() is not None:
             cmd = [
                 FFMPEG_BIN,
-                "-hide_banner", "-loglevel", "info",
+                "-hide_banner",
+                "-loglevel", "warning",      # menos spam
                 "-nostats",
 
-                # Que ffmpeg genere PTS limpios y use bajo buffer
+                # Generar PTS a partir de wallclock, búfer bajo
                 "-fflags", "+genpts+nobuffer",
-                "-thread_queue_size", "512",
+                "-use_wallclock_as_timestamps", "1",
+                "-thread_queue_size", "1024",
 
                 "-probesize", "5000000",
                 "-analyzeduration", "5000000",
 
-                # OJO: NO forzamos formato (-f) para que ffmpeg detecte PS/TS/H264
+                # No forzamos -f: que detecte PS/TS/H264
                 "-i", str(self.pipe_path),
 
                 # Sólo vídeo
                 "-map", "0:v:0?",
                 "-an",
-                "-c:v", "copy",
 
-                # No intentes duplicar/dropear frames
-                "-vsync", "0",
+                # RE-ENCODE → más robusto para VLC/HLS
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-tune", "zerolatency",
+                "-g", "50",          # GOP ~2s @25fps
+                "-keyint_min", "25",
+                "-sc_threshold", "0",
 
                 "-f", "hls",
                 "-hls_time", "2",
@@ -152,7 +159,7 @@ class StreamProc:
         # Abrir la FIFO para escritura y mantenerla abierta
         if self.fh is None or self.fh.closed:
             try:
-                # 'wb' en vez de 'ab', sin buffer
+                # 'wb' sin buffer
                 self.fh = open(self.pipe_path, "wb", buffering=0)
                 LOG.info(f"[{self.key}] FIFO abierta para escritura")
             except FileNotFoundError:
@@ -259,9 +266,6 @@ class JT1078Handler:
             typ_sub = data[15]
             data_type = (typ_sub >> 4) & 0x0F
             subflag   = typ_sub & 0x0F
-
-            # IMPORTANTE: ya NO filtramos por data_type, mandamos todo
-            # porque algunos vendors meten SPS/PPS o PS en "tipos raros".
 
             if len(data) < DATA_BODY_LEN_OFFSET + 2:
                 return
