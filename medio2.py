@@ -9,13 +9,53 @@ import subprocess
 import binascii
 import threading
 import sys
+import shutil
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 LOG = logging.getLogger("jt1078")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# Rutas base
 MEDIA_ROOT = pathlib.Path("./www")      # aquí quedarán los .m3u8 y .ts por SIM_CANAL/
 PIPE_ROOT  = pathlib.Path("./pipes")    # named pipes para ffmpeg
+
+# -------- LIMPIEZA AL ARRANCAR --------
+def clean_start():
+    # 1) Limpiar pipes viejos
+    if PIPE_ROOT.exists():
+        for p in PIPE_ROOT.iterdir():
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                LOG.warning(f"Error limpiando pipe {p}: {e}")
+
+    # 2) Limpiar HLS viejo en www/
+    if MEDIA_ROOT.exists():
+        for child in MEDIA_ROOT.iterdir():
+            try:
+                if child.is_dir():
+                    # borra carpetas por SIM_CANAL (000012345678_1, etc.)
+                    shutil.rmtree(child)
+                else:
+                    # por si hubiera m3u8/ts sueltos
+                    if child.suffix in (".m3u8", ".ts"):
+                        child.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                LOG.warning(f"Error limpiando media {child}: {e}")
+
+    LOG.info("Limpieza inicial de pipes/ y www/ completada")
+
+# Ejecutar limpieza antes de crear directorios
+clean_start()
+
+# Asegurar que los directorios existen
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 PIPE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -416,4 +456,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        LOG.info("Servidor detenido por teclado (Ctrl+C)")
+        LOG.info("Servidor detenido por teclado")
