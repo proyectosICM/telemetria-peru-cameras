@@ -10,19 +10,43 @@ import binascii
 import threading
 import sys
 import shutil
+import argparse
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 LOG = logging.getLogger("jt1078")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Rutas base
-MEDIA_ROOT = pathlib.Path("./www")      # aquí quedarán los .m3u8 y .ts por SIM_CANAL/
+MEDIA_ROOT = pathlib.Path("./www")      # .m3u8 y .ts por SIM_CANAL/
 PIPE_ROOT  = pathlib.Path("./pipes")    # named pipes para ffmpeg
-RAW_ROOT   = pathlib.Path("./raw")      # aquí vamos a tirar paquetes crudos / payloads
+RAW_ROOT   = pathlib.Path("./raw")      # dumps crudos / payloads
 
-# -------- LIMPIEZA AL ARRANCAR --------
+# Offsets JT1078
+DATA_BODY_LEN_OFFSET = 28
+DATA_BODY_OFFSET     = 30
+
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "/usr/bin/ffmpeg")
+
+MEDIA_UDP_PORT  = 7200
+MEDIA_TCP_PORT  = 7200
+MEDIA_HTTP_PORT = 2000
+
+
+# ----------------- utilidades comunes -----------------
+
+def bcd6_to_str(b: bytes) -> str:
+    out = []
+    for x in b:
+        out.append(f"{(x >> 4) & 0xF}{x & 0xF}")
+    return "".join(out)
+
+
 def clean_start():
-    # 1) Limpiar pipes viejos
+    """
+    Limpia pipes/, www/ y raw/ al arrancar el SERVIDOR.
+    (NO se usa en modo --scan.)
+    """
+    # 1) pipes
     if PIPE_ROOT.exists():
         for p in PIPE_ROOT.iterdir():
             try:
@@ -35,7 +59,7 @@ def clean_start():
             except Exception as e:
                 LOG.warning(f"Error limpiando pipe {p}: {e}")
 
-    # 2) Limpiar HLS viejo en www/
+    # 2) HLS viejo
     if MEDIA_ROOT.exists():
         for child in MEDIA_ROOT.iterdir():
             try:
@@ -49,7 +73,7 @@ def clean_start():
             except Exception as e:
                 LOG.warning(f"Error limpiando media {child}: {e}")
 
-    # 3) Limpiar dumps viejos en raw/
+    # 3) dumps viejos
     if RAW_ROOT.exists():
         for child in RAW_ROOT.iterdir():
             try:
@@ -62,126 +86,8 @@ def clean_start():
 
     LOG.info("Limpieza inicial de pipes/, www/ y raw/ completada")
 
-clean_start()
 
-# Asegurar que los directorios existen
-MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
-PIPE_ROOT.mkdir(parents=True, exist_ok=True)
-RAW_ROOT.mkdir(parents=True, exist_ok=True)
-
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "/usr/bin/ffmpeg")
-
-MEDIA_UDP_PORT  = 7200
-MEDIA_TCP_PORT  = 7200
-MEDIA_HTTP_PORT = 2000
-
-DATA_BODY_LEN_OFFSET = 28
-DATA_BODY_OFFSET     = 30
-
-
-def bcd6_to_str(b: bytes) -> str:
-    out = []
-    for x in b:
-        out.append(f"{(x >> 4) & 0xF}{x & 0xF}")
-    return "".join(out)
-
-
-# ============================================================
-# === NAL SCAN: detectar SPS / PPS / IDR / demás en un .bin ===
-# ============================================================
-
-NAL_START_CODES = (b"\x00\x00\x01", b"\x00\x00\x00\x01")
-
-
-def iter_nals_h264(payload: bytes):
-    """
-    Itera sobre NAL units en un buffer H.264 (Annex B):
-    detecta start codes 0x000001 o 0x00000001 y devuelve (nal_type, nal_data).
-    """
-    i = 0
-    n = len(payload)
-    while i < n:
-        # buscar siguiente start code
-        start = -1
-        sc_len = 0
-        while i < n - 3 and start == -1:
-            if payload[i:i+3] == b"\x00\x00\x01":
-                start = i
-                sc_len = 3
-            elif i < n - 4 and payload[i:i+4] == b"\x00\x00\x00\x01":
-                start = i
-                sc_len = 4
-            else:
-                i += 1
-
-        if start == -1:
-            break  # no hay más
-
-        # buscar el próximo start code para cortar este NAL
-        j = start + sc_len
-        next_start = -1
-        while j < n - 3 and next_start == -1:
-            if payload[j:j+3] == b"\x00\x00\x01" or (
-                j < n - 4 and payload[j:j+4] == b"\x00\x00\x00\x01"
-            ):
-                next_start = j
-            else:
-                j += 1
-
-        if next_start == -1:
-            nal = payload[start + sc_len :]
-            i = n
-        else:
-            nal = payload[start + sc_len : next_start]
-            i = next_start
-
-        if not nal:
-            continue
-
-        nal_type = nal[0] & 0x1F
-        yield nal_type, nal
-
-
-def scan_file_for_sps_pps(path: pathlib.Path):
-    """
-    Abre un archivo binario H.264 y cuenta SPS, PPS, IDR y otros NAL.
-    Útil para ver si tus dumps contienen las cabeceras iniciales.
-    """
-    if not path.exists():
-        print(f"[SCAN] {path} no existe")
-        return
-
-    data = path.read_bytes()
-    total = 0
-    counts = {
-        "SPS(7)": 0,
-        "PPS(8)": 0,
-        "IDR(5)": 0,
-        "NON_IDR(1)": 0,
-        "OTROS": 0,
-    }
-
-    for nal_type, _nal in iter_nals_h264(data):
-        total += 1
-        if nal_type == 7:
-            counts["SPS(7)"] += 1
-        elif nal_type == 8:
-            counts["PPS(8)"] += 1
-        elif nal_type == 5:
-            counts["IDR(5)"] += 1
-        elif nal_type == 1:
-            counts["NON_IDR(1)"] += 1
-        else:
-            counts["OTROS"] += 1
-
-    print(f"\n[SCAN] Archivo: {path}")
-    print(f"  NALs totales: {total}")
-    for k, v in counts.items():
-        print(f"  {k}: {v}")
-    print("")
-
-
-# ======================== STREAM / HLS ========================
+# ----------------- ffmpeg / HLS -----------------
 
 class StreamProc:
     def __init__(self, key: str):
@@ -276,11 +182,14 @@ class StreamProc:
             self.ff = None
 
 
+# ----------------- reensamblado subpaquetes JT1078 -----------------
+
 class Reassembler:
     def __init__(self):
         self.buffers = {}
 
     def feed(self, key: str, subflag: int, payload: bytes):
+        # 0 = paquete completo
         if subflag == 0:
             return payload
         buf = self.buffers.setdefault(key, bytearray())
@@ -299,6 +208,8 @@ class Reassembler:
         else:
             return payload
 
+
+# ----------------- handler JT1078 (server) -----------------
 
 class JT1078Handler:
     def __init__(self):
@@ -339,7 +250,7 @@ class JT1078Handler:
             if len(data) < DATA_BODY_OFFSET:
                 return
 
-            # 4 bytes magic
+            # magic 0x30 0x31 0x63 0x64
             if data[0:4] != b"\x30\x31\x63\x64":
                 return
 
@@ -368,7 +279,7 @@ class JT1078Handler:
 
             key = f"{sim}_{chan}"
 
-            # 🔍 Dump de depuración de paquete crudo + body
+            # dump raw
             self._dump_raw_packet(key, data, body)
 
             out = self.reasm.feed(key, subflag, body)
@@ -434,6 +345,8 @@ class JT1078TCPServer:
             LOG.info(f"JT1078 TCP conexión cerrada {addr}")
 
 
+# ----------------- HTTP embebido -----------------
+
 class QuietHTTPServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         exc_type, exc, tb = sys.exc_info()
@@ -470,7 +383,89 @@ def start_http_server():
     httpd.serve_forever()
 
 
-async def main_server():
+# ----------------- SCAN SPS/PPS/IDR -----------------
+
+def scan_h264_file(path: pathlib.Path):
+    if not path.exists():
+        print(f"[SCAN] {path} no existe")
+        return
+
+    data = path.read_bytes()
+    size = len(data)
+
+    sps = pps = idr = non_idr = 0
+    total_nalus = 0
+
+    i = 0
+    while i < size - 4:
+        # buscar start code 00 00 01 o 00 00 00 01
+        if data[i] == 0x00 and data[i+1] == 0x00 and data[i+2] == 0x01:
+            start = i
+            j = i + 3
+        elif data[i] == 0x00 and data[i+1] == 0x00 and data[i+2] == 0x00 and data[i+3] == 0x01:
+            start = i
+            j = i + 4
+        else:
+            i += 1
+            continue
+
+        if j >= size:
+            break
+
+        nal_header = data[j]
+        nal_type = nal_header & 0x1F
+        total_nalus += 1
+
+        if nal_type == 7:
+            sps += 1
+        elif nal_type == 8:
+            pps += 1
+        elif nal_type == 5:
+            idr += 1
+        elif nal_type == 1:
+            non_idr += 1
+
+        # avanzar al siguiente posible start code
+        i = j + 1
+
+    print(f"\n[SCAN] {path}")
+    print(f"  size bytes : {size}")
+    print(f"  NALUs tot  : {total_nalus}")
+    print(f"  SPS (7)    : {sps}")
+    print(f"  PPS (8)    : {pps}")
+    print(f"  IDR  (5)   : {idr}")
+    print(f"  non-IDR(1) : {non_idr}")
+    if sps == 0 or pps == 0:
+        print("  ⚠ Parece que NO hay SPS/PPS completos o están muy fragmentados.")
+    else:
+        print("  ✅ Se ven SPS/PPS → cabeceras H.264 presentes.")
+
+
+def scan_mode(paths: list[str]):
+    """
+    Modo: --scan archivo1 archivo2 ...
+    """
+    if not paths:
+        print("[SCAN] Debes pasar al menos un archivo, ej:")
+        print("       python jt1078_media_server.py --scan raw/000012345678_1_body_0000.bin")
+        return
+
+    for p in paths:
+        scan_h264_file(pathlib.Path(p))
+
+
+# ----------------- main server (async) -----------------
+
+async def run_server():
+    # limpiar sólo en modo servidor
+    clean_start()
+
+    # asegurar directorios
+    MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+    PIPE_ROOT.mkdir(parents=True, exist_ok=True)
+    RAW_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # lanzar HTTP
     t = threading.Thread(target=start_http_server, daemon=True)
     t.start()
 
@@ -508,15 +503,29 @@ async def main_server():
         LOG.info("Servidor de medios cerrado.")
 
 
-if __name__ == "__main__":
-    # Modo especial: sólo escanear archivos .bin / .h264
-    if len(sys.argv) >= 3 and sys.argv[1] == "--scan":
-        for arg in sys.argv[2:]:
-            scan_file_for_sps_pps(pathlib.Path(arg))
-        sys.exit(0)
+# ----------------- entrypoint -----------------
 
-    # Modo normal: levantar servidor
+def main():
+    parser = argparse.ArgumentParser(description="JT1078 media server + H264 scanner")
+    parser.add_argument(
+        "--scan",
+        nargs="+",
+        help="Analizar uno o más ficheros .bin/.h264 y contar SPS/PPS/IDR",
+    )
+
+    args = parser.parse_args()
+
+    if args.scan:
+        # MODO SCAN: NO limpiar, NO levantar server
+        scan_mode(args.scan)
+        return
+
+    # MODO SERVER
     try:
-        asyncio.run(main_server())
+        asyncio.run(run_server())
     except KeyboardInterrupt:
         LOG.info("Servidor detenido por teclado")
+
+
+if __name__ == "__main__":
+    main()
