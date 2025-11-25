@@ -96,11 +96,15 @@ raw_logger.setLevel(logging.INFO)
 raw_fh = RotatingFileHandler("jtt808_raw.log", maxBytes=10_000_000, backupCount=2)
 raw_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 raw_logger.addHandler(raw_fh)
+# No propagar al logger padre para que no salga en consola
+raw_logger.propagate = False
 
 pos_logger = logging.getLogger("jtt808.pos")
 pos_logger.setLevel(logging.INFO)
 pos_fh = RotatingFileHandler("jtt808_pos.jsonl", maxBytes=10_000_000, backupCount=2)
 pos_logger.addHandler(pos_fh)
+# Igual: solo archivo, no consola
+pos_logger.propagate = False
 
 
 # === Header 808 (2013) ===
@@ -462,7 +466,7 @@ MSG_HANDLERS = {
 class SessionState:
     def __init__(self):
         self.flow = Flow()
-        self.video_started = False  # <--- NUEVO FLAG
+        self.video_started = False  # <--- FLAG
 
     def next_flow(self) -> bytes:
         return self.flow.next()
@@ -488,8 +492,9 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
         frame_type=VIDEO_FRAME_TYPE,
     )
     logger.info(
-        f"→ CMD 0x9101 Start AV ch={VIDEO_CHANNEL} "
-        f"to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT}"
+        f"[TX srv->term] phone={hdr['phone_str']} "
+        f"msgId=0x9101 (StartAV ch={VIDEO_CHANNEL} "
+        f"to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT})"
     )
     writer.write(av)
     await writer.drain()
@@ -502,7 +507,10 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
         close_av_type=0,
         switch_stream_type=VIDEO_FRAME_TYPE,
     )
-    logger.info(f"→ CMD 0x9102 Control START ch={VIDEO_CHANNEL}")
+    logger.info(
+        f"[TX srv->term] phone={hdr['phone_str']} "
+        f"msgId=0x9102 (AVControl START ch={VIDEO_CHANNEL})"
+    )
     writer.write(av_ctrl)
     await writer.drain()
 
@@ -553,13 +561,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         logger.warning("Checksum inválido, descartando frame")
                         continue
 
-                    hdr = parse_header(payload[:-1])  # sin checksum
+                    # sin checksum
+                    hdr = parse_header(payload[:-1])
                     body = payload[:-1][hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]]
 
-                    # Log raw frame/hex
-                    raw_logger.info(binascii.hexlify(payload).decode())
+                    # Log raw frame/hex con dirección RX
+                    hex_payload = binascii.hexlify(payload).decode()
+                    raw_logger.info(
+                        "RX term->srv phone=%s msgId=0x%s %s",
+                        hdr["phone_str"],
+                        hdr["msg_id"].hex(),
+                        hex_payload,
+                    )
+
                     logger.info(
-                        f"[FRAME] msgId=0x{hdr['msg_id'].hex()} "
+                        f"[RX term->srv] msgId=0x{hdr['msg_id'].hex()} "
                         f"phone={hdr['phone_str']} body_len={hdr['body_len']} "
                         f"has_subpkg={hdr['has_subpkg']}"
                     )
@@ -570,8 +586,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         resp = handler(session, hdr, body)
                         if resp:
                             logger.info(
-                                f"→ RESP to {hdr['phone_str']} "
-                                f"msgId=0x{hdr['msg_id'].hex()} "
+                                f"[TX srv->term] phone={hdr['phone_str']} "
+                                f"resp_for=0x{hdr['msg_id'].hex()} "
                                 f"flow={int.from_bytes(hdr['flow_id'], 'big')}"
                             )
                             writer.write(resp)
@@ -581,7 +597,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         if msg_id == b'\x01\x02':
                             if ASK_LOCATION_AFTER_AUTH:
                                 cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
-                                logger.info(f"→ CMD 0x8201 Location Query to {hdr['phone_str']}")
+                                logger.info(
+                                    f"[TX srv->term] phone={hdr['phone_str']} "
+                                    f"msgId=0x8201 (LocationQuery)"
+                                )
                                 writer.write(cmd)
                                 await writer.drain()
                             if START_TEMP_TRACKING_AFTER_AUTH:
@@ -591,8 +610,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                     validity_min=TEMP_TRACK_DURATION_MIN
                                 )
                                 logger.info(
-                                    f"→ CMD 0x8202 Temp Tracking to {hdr['phone_str']} "
-                                    f"({TEMP_TRACK_INTERVAL_S}s x {TEMP_TRACK_DURATION_MIN}min)"
+                                    f"[TX srv->term] phone={hdr['phone_str']} "
+                                    f"msgId=0x8202 (TempTracking "
+                                    f"{TEMP_TRACK_INTERVAL_S}s x {TEMP_TRACK_DURATION_MIN}min)"
                                 )
                                 writer.write(cmd2)
                                 await writer.drain()
@@ -603,7 +623,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         # Fallback: si ya está mandando 0x0200 y aún no hemos arrancado video,
                         # disparamos el 0x9101/0x9102 aquí.
                         if msg_id == b'\x02\x00' and not session.video_started:
-                            logger.info(f"[VIDEO] Arrancando video por 0x0200 para {hdr['phone_str']}")
+                            logger.info(
+                                f"[VIDEO] trigger por 0x0200 (RX term->srv) "
+                                f"phone={hdr['phone_str']}, arrancando 0x9101/0x9102 (TX srv->term)"
+                            )
                             await start_video_if_needed(session, hdr, writer)
 
                     else:
@@ -618,6 +641,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 hdr["flow_id"],
                                 hdr["msg_id"],
                                 0
+                            )
+                            logger.info(
+                                f"[TX srv->term] phone={hdr['phone_str']} "
+                                f"msgId=0x8001 (Ack UNKNOWN 0x{hdr['msg_id'].hex()})"
                             )
                             writer.write(resp)
                             await writer.drain()
