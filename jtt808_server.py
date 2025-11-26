@@ -72,18 +72,11 @@ def parse_time_bcd6(b: bytes) -> datetime:
     s = bcd_to_str(b)  # "YYMMDDhhmmss"
     yy = int(s[0:2])
     year = 2000 + yy if yy < 70 else 1900 + yy
-    return datetime(
-        year,
-        int(s[2:4]),
-        int(s[4:6]),
-        int(s[6:8]),
-        int(s[8:10]),
-        int(s[10:12]),
-    )
+    return datetime(year, int(s[2:4]), int(s[4:6]), int(s[6:8]), int(s[8:10]), int(s[10:12]))
 
 
 def parse_coord_u32(raw: bytes) -> float:
-    v = int.from_bytes(raw, "big", signed=False)
+    v = int.from_bytes(raw, 'big', signed=False)
     return v / 1_000_000.0
 
 
@@ -120,7 +113,7 @@ def parse_header(payload: bytes):
         raise ValueError("Frame demasiado corto para header 808")
     msg_id = payload[0:2]
     props = payload[2:4]
-    phone = payload[4:10]  # BCD
+    phone = payload[4:10]       # BCD
     flow_id = payload[10:12]
     body_len = ((props[0] & 0x03) << 8) | props[1]  # 10 bits
     has_subpkg = (props[0] & 0x20) != 0
@@ -140,18 +133,18 @@ def parse_header(payload: bytes):
         "has_subpkg": has_subpkg,
         "subpkg": subpkg,
         "body_len": body_len,
-        "body_idx": idx,
+        "body_idx": idx
     }
 
 
 # === Build headers/responses ===
 def build_props(body_len: int, subpkg=False, encrypt=0):
     val = 0
-    val |= body_len & 0x03FF
+    val |= (body_len & 0x03FF)
     val |= (encrypt & 0x7) << 10
     if subpkg:
-        val |= 1 << 13
-    return val.to_bytes(2, "big")
+        val |= (1 << 13)
+    return val.to_bytes(2, 'big')
 
 
 class Flow:
@@ -160,10 +153,10 @@ class Flow:
 
     def next(self) -> bytes:
         self._v = (self._v + 1) & 0xFFFF
-        return self._v.to_bytes(2, "big")
+        return self._v.to_bytes(2, 'big')
 
 
-def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, body: bytes = b""):
+def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, body: bytes = b''):
     header = msg_id + build_props(len(body)) + phone_bcd + flow_id_platform
     frame = header + body
     cs = bytes([checksum(frame)])
@@ -172,88 +165,68 @@ def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, bod
 
 
 # 0x8001 – Platform general response
-def build_0x8001(
-    phone_bcd: bytes,
-    flow_id_platform: bytes,
-    orig_flow_id: bytes,
-    orig_msg_id: bytes,
-    result: int,
-):
+def build_0x8001(phone_bcd: bytes, flow_id_platform: bytes,
+                 orig_flow_id: bytes, orig_msg_id: bytes, result: int):
     # Body: resp_msgId (WORD) + resp_flowId (WORD) + result(BYTE)
     body = orig_flow_id + orig_msg_id + bytes([result])
-    return build_downlink(b"\x80\x01", phone_bcd, flow_id_platform, body)
+    return build_downlink(b'\x80\x01', phone_bcd, flow_id_platform, body)
 
 
 # 0x8100 – Register response
-def build_0x8100(
-    phone_bcd: bytes,
-    flow_id_platform: bytes,
-    orig_flow_id: bytes,
-    result: int = 0,
-    auth_code: bytes = b"",
-):
+def build_0x8100(phone_bcd: bytes, flow_id_platform: bytes,
+                 orig_flow_id: bytes, result: int = 0, auth_code: bytes = b''):
     # Body: flowId (WORD) + result (BYTE) + auth_code(n)
     body = orig_flow_id + bytes([result]) + auth_code
-    return build_downlink(b"\x81\x00", phone_bcd, flow_id_platform, body)
+    return build_downlink(b'\x81\x00', phone_bcd, flow_id_platform, body)
 
 
 # 0x8201 – Location information query (cuerpo vacío)
 def build_0x8201(phone_bcd: bytes, flow_id_platform: bytes):
-    return build_downlink(b"\x82\x01", phone_bcd, flow_id_platform, b"")
+    return build_downlink(b'\x82\x01', phone_bcd, flow_id_platform, b'')
 
 
 # 0x8202 – Temporary tracking control: interval_s(2B) + validity_min(4B)
-def build_0x8202(
-    phone_bcd: bytes,
-    flow_id_platform: bytes,
-    interval_s: int,
-    validity_min: int,
-):
-    body = interval_s.to_bytes(2, "big") + validity_min.to_bytes(4, "big")
-    return build_downlink(b"\x82\x02", phone_bcd, flow_id_platform, body)
+def build_0x8202(phone_bcd: bytes, flow_id_platform: bytes,
+                 interval_s: int, validity_min: int):
+    body = interval_s.to_bytes(2, 'big') + validity_min.to_bytes(4, 'big')
+    return build_downlink(b'\x82\x02', phone_bcd, flow_id_platform, body)
 
 
 # === JT/T 1078: A/V control downlinks (via enlace 808) ===
 # 0x9101 – Real-time audio and video transmit request
-def build_0x9101(
-    phone_bcd: bytes,
-    flow_id_platform: bytes,
-    ip: str,
-    tcp_port: int,
-    udp_port: int,
-    logical_channel: int,
-    data_type: int = 1,  # 0=audio+video, 1=solo video, etc.
-    frame_type: int = 0,  # 0=main, 1=sub
-):
+def build_0x9101(phone_bcd: bytes, flow_id_platform: bytes,
+                 ip: str,
+                 tcp_port: int,
+                 udp_port: int,
+                 logical_channel: int,
+                 data_type: int = 1,      # 0=audio+video, 1=solo video, etc.
+                 frame_type: int = 0):    # 0=main, 1=sub
     ip_bytes = ip.encode("ascii")
 
     body = bytearray()
-    body.append(len(ip_bytes))  # IP_len
-    body += ip_bytes  # IP
-    body += tcp_port.to_bytes(2, "big")  # TCP port
-    body += udp_port.to_bytes(2, "big")  # UDP port
-    body.append(logical_channel & 0xFF)  # logical channel
-    body.append(data_type & 0xFF)  # data type
-    body.append(frame_type & 0xFF)  # frame type
+    body.append(len(ip_bytes))                # IP_len
+    body += ip_bytes                          # IP
+    body += tcp_port.to_bytes(2, 'big')       # TCP port
+    body += udp_port.to_bytes(2, 'big')       # UDP port
+    body.append(logical_channel & 0xFF)       # logical channel
+    body.append(data_type & 0xFF)             # data type
+    body.append(frame_type & 0xFF)            # frame type
 
-    return build_downlink(b"\x91\x01", phone_bcd, flow_id_platform, bytes(body))
+    return build_downlink(b'\x91\x01', phone_bcd, flow_id_platform, bytes(body))
 
 
 # 0x9102 – Real-time AV transmit control
-def build_0x9102(
-    phone_bcd: bytes,
-    flow_id_platform: bytes,
-    logical_channel: int,
-    control_cmd: int = 1,
-    close_av_type: int = 0,
-    switch_stream_type: int = 0,
-):
+def build_0x9102(phone_bcd: bytes, flow_id_platform: bytes,
+                 logical_channel: int,
+                 control_cmd: int = 1,
+                 close_av_type: int = 0,
+                 switch_stream_type: int = 0):
     body = bytearray()
     body.append(logical_channel & 0xFF)
     body.append(control_cmd & 0xFF)
-    body += close_av_type.to_bytes(2, "big")
-    body += switch_stream_type.to_bytes(2, "big")
-    return build_downlink(b"\x91\x02", phone_bcd, flow_id_platform, bytes(body))
+    body += close_av_type.to_bytes(2, 'big')
+    body += switch_stream_type.to_bytes(2, 'big')
+    return build_downlink(b'\x91\x02', phone_bcd, flow_id_platform, bytes(body))
 
 
 # === Handlers uplink ===
@@ -265,7 +238,7 @@ def handle_0001_terminal_general_resp(session, hdr, body):
     if len(body) < 5:
         logger.warning(f"[0001] body demasiado corto: len={len(body)}")
         return None
-    resp_flow = int.from_bytes(body[0:2], "big")
+    resp_flow = int.from_bytes(body[0:2], 'big')
     resp_msg_id = body[2:4]
     result = body[4]
     logger.info(
@@ -279,19 +252,8 @@ def handle_0001_terminal_general_resp(session, hdr, body):
 def handle_0002_heartbeat(session, hdr, body):
     # Terminal heartbeat → responde ACK general
     logger.info(f"[0002] Heartbeat desde phone={hdr['phone_str']}")
-    resp = build_0x8001(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        hdr["flow_id"],
-        hdr["msg_id"],
-        0,
-    )
-    logger.info(
-        f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x8001 (PlatformGeneralResponse) "
-        f"resp_for=0x0002 (Heartbeat)"
-    )
-    return resp
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], hdr["msg_id"], 0)
 
 
 def handle_0100_register(session, hdr, body):
@@ -306,13 +268,13 @@ def handle_0100_register(session, hdr, body):
       plate (GBK/ASCII, variable)
     """
     try:
-        prov = int.from_bytes(body[0:2], "big")
-        city = int.from_bytes(body[2:4], "big")
-        manu = body[4:9].decode("ascii", errors="ignore").strip()
-        model = body[9:29].decode("ascii", errors="ignore").strip()
-        term_id = body[29:36].decode("ascii", errors="ignore").strip()
+        prov = int.from_bytes(body[0:2], 'big')
+        city = int.from_bytes(body[2:4], 'big')
+        manu = body[4:9].decode('ascii', errors='ignore').strip()
+        model = body[9:29].decode('ascii', errors='ignore').strip()
+        term_id = body[29:36].decode('ascii', errors='ignore').strip()
         plate_color = body[36]
-        plate = body[37:].decode("ascii", errors="ignore").strip()
+        plate = body[37:].decode('ascii', errors='ignore').strip()
 
         logger.info(
             f"[0100] Registro terminal OK phone={hdr['phone_str']} "
@@ -321,60 +283,35 @@ def handle_0100_register(session, hdr, body):
         )
     except Exception as e:
         logger.exception(f"Error parseando 0x0100: {e}")
-        logger.info(
-            f"[0100] Registro terminal phone={hdr['phone_str']} "
-            f"(body_len={len(body)})"
-        )
+        logger.info(f"[0100] Registro terminal phone={hdr['phone_str']} (body_len={len(body)})")
 
     # Registro aceptado (result=0)
-    resp = build_0x8100(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        hdr["flow_id"],
-        result=0,
-        auth_code=b"",
-    )
-    logger.info(
-        f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x8100 (TerminalRegistrationResponse) "
-        f"resp_for=0x0100 (TerminalRegistration)"
-    )
-    return resp
+    return build_0x8100(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], result=0, auth_code=b'')
 
 
 def handle_0102_auth(session, hdr, body):
     # Autenticación
     try:
-        token = body.decode(errors="ignore") if body else ""
+        token = body.decode(errors='ignore') if body else ''
     except Exception:
         token = body.hex()
     logger.info(f"[0102] auth phone={hdr['phone_str']} token={token!r}")
     # ACK general
-    resp = build_0x8001(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        hdr["flow_id"],
-        hdr["msg_id"],
-        0,
-    )
-    logger.info(
-        f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x8001 (PlatformGeneralResponse) "
-        f"resp_for=0x0102 (TerminalAuthentication)"
-    )
-    return resp
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], hdr["msg_id"], 0)
 
 
 def handle_0200_position(session, hdr, body):
     # Posición
     try:
-        alarm = int.from_bytes(body[0:4], "big")
-        status = int.from_bytes(body[4:8], "big")
+        alarm = int.from_bytes(body[0:4], 'big')
+        status = int.from_bytes(body[4:8], 'big')
         lat = parse_coord_u32(body[8:12])
         lon = parse_coord_u32(body[12:16])
-        alt = int.from_bytes(body[16:18], "big", signed=False)
-        speed = int.from_bytes(body[18:20], "big", signed=False) / 10.0
-        course = int.from_bytes(body[20:22], "big", signed=False)
+        alt = int.from_bytes(body[16:18], 'big', signed=False)
+        speed = int.from_bytes(body[18:20], 'big', signed=False) / 10.0
+        course = int.from_bytes(body[20:22], 'big', signed=False)
         dt = parse_time_bcd6(body[22:28])
         item = {
             "phone": hdr["phone_str"],
@@ -386,44 +323,33 @@ def handle_0200_position(session, hdr, body):
             "alt": alt,
             "speed_kmh": speed,
             "course": course,
-            "time": dt.isoformat(),
+            "time": dt.isoformat()
         }
         pos_logger.info(json.dumps(item, ensure_ascii=False))
         logger.info(f"[0200] {item}")
     except Exception as e:
         logger.exception(f"Error parseando 0x0200: {e}")
-    resp = build_0x8001(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        hdr["flow_id"],
-        hdr["msg_id"],
-        0,
-    )
-    logger.info(
-        f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x8001 (PlatformGeneralResponse) "
-        f"resp_for=0x0200 (LocationReport)"
-    )
-    return resp
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], hdr["msg_id"], 0)
 
 
 def handle_0201_location_query_resp(session, hdr, body):
     # Respuesta a 0x8201: flowId(2) + estructura similar a 0x0200
     try:
         if len(body) >= 2:
-            resp_flow = int.from_bytes(body[0:2], "big")
+            resp_flow = int.from_bytes(body[0:2], 'big')
             rest = body[2:]
         else:
             resp_flow = None
             rest = body
         if len(rest) >= 28:
-            alarm = int.from_bytes(rest[0:4], "big")
-            status = int.from_bytes(rest[4:8], "big")
+            alarm = int.from_bytes(rest[0:4], 'big')
+            status = int.from_bytes(rest[4:8], 'big')
             lat = parse_coord_u32(rest[8:12])
             lon = parse_coord_u32(rest[12:16])
-            alt = int.from_bytes(rest[16:18], "big", signed=False)
-            speed = int.from_bytes(rest[18:20], "big", signed=False) / 10.0
-            course = int.from_bytes(rest[20:22], "big", signed=False)
+            alt = int.from_bytes(rest[16:18], 'big', signed=False)
+            speed = int.from_bytes(rest[18:20], 'big', signed=False) / 10.0
+            course = int.from_bytes(rest[20:22], 'big', signed=False)
             dt = parse_time_bcd6(rest[22:28])
             item = {
                 "phone": hdr["phone_str"],
@@ -436,30 +362,16 @@ def handle_0201_location_query_resp(session, hdr, body):
                 "alt": alt,
                 "speed_kmh": speed,
                 "course": course,
-                "time": dt.isoformat(),
+                "time": dt.isoformat()
             }
             pos_logger.info(json.dumps(item, ensure_ascii=False))
             logger.info(f"[0201] {item}")
         else:
-            logger.info(
-                f"[0201] resp_flow={resp_flow} body_len={len(body)} "
-                "(no parseable como 0x0200)"
-            )
+            logger.info(f"[0201] resp_flow={resp_flow} body_len={len(body)} (no parseable como 0x0200)")
     except Exception as e:
         logger.exception(f"Error parseando 0x0201: {e}")
-    resp = build_0x8001(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        hdr["flow_id"],
-        hdr["msg_id"],
-        0,
-    )
-    logger.info(
-        f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x8001 (PlatformGeneralResponse) "
-        f"resp_for=0x0201 (LocationQueryResponse)"
-    )
-    return resp
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], hdr["msg_id"], 0)
 
 
 def handle_0704_batch_positions(session, hdr, body):
@@ -475,36 +387,21 @@ def handle_0704_batch_positions(session, hdr, body):
     try:
         if len(body) < 4:
             logger.warning(f"[0704] body demasiado corto: len={len(body)}")
-            resp = build_0x8001(
-                hdr["phone_bcd"],
-                session.next_flow(),
-                hdr["flow_id"],
-                hdr["msg_id"],
-                0,
-            )
-            logger.info(
-                f"[TX srv->term] phone={hdr['phone_str']} "
-                f"msgId=0x8001 (PlatformGeneralResponse) "
-                f"resp_for=0x0704 (BatchLocationUpload, body corto)"
-            )
-            return resp
+            return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                                hdr["flow_id"], hdr["msg_id"], 0)
 
         count = body[0]
         batch_type = body[1]
         idx = 2
 
-        logger.info(
-            f"[0704] phone={hdr['phone_str']} count={count} type={batch_type}"
-        )
+        logger.info(f"[0704] phone={hdr['phone_str']} count={count} type={batch_type}")
 
         for i in range(count):
             if idx + 2 > len(body):
-                logger.warning(
-                    f"[0704] sin espacio para data_len en registro {i}"
-                )
+                logger.warning(f"[0704] sin espacio para data_len en registro {i}")
                 break
 
-            data_len = int.from_bytes(body[idx : idx + 2], "big")
+            data_len = int.from_bytes(body[idx:idx + 2], "big")
             idx += 2
 
             if idx + data_len > len(body):
@@ -513,18 +410,18 @@ def handle_0704_batch_positions(session, hdr, body):
                 )
                 break
 
-            data = body[idx : idx + data_len]
+            data = body[idx:idx + data_len]
             idx += data_len
 
             # 'data' es como el body de 0x0200
             try:
-                alarm = int.from_bytes(data[0:4], "big")
-                status = int.from_bytes(data[4:8], "big")
+                alarm = int.from_bytes(data[0:4], 'big')
+                status = int.from_bytes(data[4:8], 'big')
                 lat = parse_coord_u32(data[8:12])
                 lon = parse_coord_u32(data[12:16])
-                alt = int.from_bytes(data[16:18], "big", signed=False)
-                speed = int.from_bytes(data[18:20], "big", signed=False) / 10.0
-                course = int.from_bytes(data[20:22], "big", signed=False)
+                alt = int.from_bytes(data[16:18], 'big', signed=False)
+                speed = int.from_bytes(data[18:20], 'big', signed=False) / 10.0
+                course = int.from_bytes(data[20:22], 'big', signed=False)
                 dt = parse_time_bcd6(data[22:28])
 
                 item = {
@@ -539,53 +436,30 @@ def handle_0704_batch_positions(session, hdr, body):
                     "alt": alt,
                     "speed_kmh": speed,
                     "course": course,
-                    "time": dt.isoformat(),
+                    "time": dt.isoformat()
                 }
                 pos_logger.info(json.dumps(item, ensure_ascii=False))
                 logger.info(f"[0704] item[{i}] {item}")
             except Exception as ex_item:
-                logger.exception(
-                    f"Error parseando registro {i} de 0x0704: {ex_item}"
-                )
+                logger.exception(f"Error parseando registro {i} de 0x0704: {ex_item}")
 
     except Exception as e:
         logger.exception(f"Error manejando 0x0704: {e}")
 
     # Devolver ACK general OK
-    resp = build_0x8001(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        hdr["flow_id"],
-        hdr["msg_id"],
-        0,
-    )
-    logger.info(
-        f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x8001 (PlatformGeneralResponse) "
-        f"resp_for=0x0704 (BatchLocationUpload)"
-    )
-    return resp
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(),
+                        hdr["flow_id"], hdr["msg_id"], 0)
 
 
 MSG_HANDLERS = {
-    b"\x00\x01": handle_0001_terminal_general_resp,  # ACK general del terminal
-    b"\x00\x02": handle_0002_heartbeat,  # heartbeat terminal
-    b"\x01\x00": handle_0100_register,  # registro
-    b"\x01\x02": handle_0102_auth,  # autenticación
-    b"\x02\x00": handle_0200_position,  # posición
-    b"\x02\x01": handle_0201_location_query_resp,  # respuesta a 0x8201
-    b"\x07\x04": handle_0704_batch_positions,  # posiciones en lote
+    b'\x00\x01': handle_0001_terminal_general_resp,   # ACK general del terminal
+    b'\x00\x02': handle_0002_heartbeat,              # heartbeat terminal
+    b'\x01\x00': handle_0100_register,               # registro
+    b'\x01\x02': handle_0102_auth,                   # autenticación
+    b'\x02\x00': handle_0200_position,               # posición
+    b'\x02\x01': handle_0201_location_query_resp,    # respuesta a 0x8201
+    b'\x07\x04': handle_0704_batch_positions,        # posiciones en lote
     # agrega aquí más: 0x0801 (multimedia), etc.
-}
-
-MSG_NAMES = {
-    b"\x00\x01": "TerminalGeneralResponse",
-    b"\x00\x02": "Heartbeat",
-    b"\x01\x00": "TerminalRegistration",
-    b"\x01\x02": "TerminalAuthentication",
-    b"\x02\x00": "LocationReport",
-    b"\x02\x01": "LocationQueryResponse",
-    b"\x07\x04": "BatchLocationUpload",
 }
 
 
@@ -609,8 +483,7 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
 
     # 0x9101 – Start AV
     av = build_0x9101(
-        hdr["phone_bcd"],
-        session.next_flow(),
+        hdr["phone_bcd"], session.next_flow(),
         ip=VIDEO_TARGET_IP,
         tcp_port=VIDEO_TCP_PORT,
         udp_port=VIDEO_UDP_PORT,
@@ -628,8 +501,7 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
 
     # 0x9102 – Control START (algunos vendors lo exigen además de 0x9101)
     av_ctrl = build_0x9102(
-        hdr["phone_bcd"],
-        session.next_flow(),
+        hdr["phone_bcd"], session.next_flow(),
         logical_channel=VIDEO_CHANNEL,
         control_cmd=1,
         close_av_type=0,
@@ -645,7 +517,7 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     # Activa TCP keepalive por conexión (evita cortes por NAT/ISP)
-    sock = writer.get_extra_info("socket")
+    sock = writer.get_extra_info('socket')
     if isinstance(sock, socket.socket):
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -658,10 +530,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         except Exception as e:
             logger.warning(f"No se pudo configurar TCP keepalive: {e}")
 
-    peer = writer.get_extra_info("peername")
+    peer = writer.get_extra_info('peername')
     logger.info(f"Conexión desde {peer}")
     session = SessionState()
-    buf = b""
+    buf = b''
     try:
         while not reader.at_eof():
             chunk = await reader.read(4096)
@@ -676,8 +548,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 e = buf.find(START_END, s + 1)
                 if e == -1:
                     break
-                frame = buf[s + 1 : e]  # sin 0x7E
-                buf = buf[e + 1 :]
+                frame = buf[s + 1:e]  # sin 0x7E
+                buf = buf[e + 1:]
 
                 try:
                     payload = de_escape(frame)
@@ -691,9 +563,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                     # sin checksum
                     hdr = parse_header(payload[:-1])
-                    body = payload[:-1][
-                        hdr["body_idx"] : hdr["body_idx"] + hdr["body_len"]
-                    ]
+                    body = payload[:-1][hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]]
 
                     # Log raw frame/hex con dirección RX
                     hex_payload = binascii.hexlify(payload).decode()
@@ -704,28 +574,29 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         hex_payload,
                     )
 
-                    msg_id = hdr["msg_id"]
-                    msg_name = MSG_NAMES.get(msg_id, "UNKNOWN")
-
                     logger.info(
-                        f"[RX term->srv] msgId=0x{msg_id.hex()} ({msg_name}) "
+                        f"[RX term->srv] msgId=0x{hdr['msg_id'].hex()} "
                         f"phone={hdr['phone_str']} body_len={hdr['body_len']} "
                         f"has_subpkg={hdr['has_subpkg']}"
                     )
 
+                    msg_id = hdr["msg_id"]
                     handler = MSG_HANDLERS.get(msg_id)
                     if handler:
                         resp = handler(session, hdr, body)
                         if resp:
+                            logger.info(
+                                f"[TX srv->term] phone={hdr['phone_str']} "
+                                f"resp_for=0x{hdr['msg_id'].hex()} "
+                                f"flow={int.from_bytes(hdr['flow_id'], 'big')}"
+                            )
                             writer.write(resp)
                             await writer.drain()
 
                         # Después de autenticación, orquestar consultas y VIDEO
-                        if msg_id == b"\x01\x02":
+                        if msg_id == b'\x01\x02':
                             if ASK_LOCATION_AFTER_AUTH:
-                                cmd = build_0x8201(
-                                    hdr["phone_bcd"], session.next_flow()
-                                )
+                                cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
                                 logger.info(
                                     f"[TX srv->term] phone={hdr['phone_str']} "
                                     f"msgId=0x8201 (LocationQuery)"
@@ -734,10 +605,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 await writer.drain()
                             if START_TEMP_TRACKING_AFTER_AUTH:
                                 cmd2 = build_0x8202(
-                                    hdr["phone_bcd"],
-                                    session.next_flow(),
+                                    hdr["phone_bcd"], session.next_flow(),
                                     interval_s=TEMP_TRACK_INTERVAL_S,
-                                    validity_min=TEMP_TRACK_DURATION_MIN,
+                                    validity_min=TEMP_TRACK_DURATION_MIN
                                 )
                                 logger.info(
                                     f"[TX srv->term] phone={hdr['phone_str']} "
@@ -752,7 +622,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                         # Fallback: si ya está mandando 0x0200 y aún no hemos arrancado video,
                         # disparamos el 0x9101/0x9102 aquí.
-                        if msg_id == b"\x02\x00" and not session.video_started:
+                        if msg_id == b'\x02\x00' and not session.video_started:
                             logger.info(
                                 f"[VIDEO] trigger por 0x0200 (RX term->srv) "
                                 f"phone={hdr['phone_str']}, arrancando 0x9101/0x9102 (TX srv->term)"
@@ -770,7 +640,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 session.next_flow(),
                                 hdr["flow_id"],
                                 hdr["msg_id"],
-                                0,
+                                0
                             )
                             logger.info(
                                 f"[TX srv->term] phone={hdr['phone_str']} "
