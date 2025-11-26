@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# server.py - JT/T 808 minimal (registro + auth + heartbeat) en puerto 6808
+# server.py - JT/T 808 minimal (registro + auth + heartbeat + posición) en puerto 6808
 
 import asyncio
 import binascii
@@ -50,7 +50,7 @@ def checksum(data: bytes) -> int:
     return s & 0xFF
 
 
-# ========== Helpers BCD ==========
+# ========== Helpers BCD / coords ==========
 def bcd_to_str(b: bytes) -> str:
     out = ""
     for x in b:
@@ -72,6 +72,14 @@ def parse_time_bcd6(b: bytes) -> datetime:
     )
 
 
+def parse_coord_u32(raw: bytes) -> float:
+    """
+    Coordenada JT808: entero * 1e-6
+    """
+    v = int.from_bytes(raw, "big", signed=False)
+    return v / 1_000_000.0
+
+
 # ========== Logging simple ==========
 logging.basicConfig(
     level=logging.INFO,
@@ -90,7 +98,7 @@ def parse_header(payload: bytes):
         raise ValueError("Frame demasiado corto para header 808")
     msg_id = payload[0:2]
     props = payload[2:4]
-    phone = payload[4:10]       # BCD
+    phone = payload[4:10]  # BCD
     flow_id = payload[10:12]
     body_len = ((props[0] & 0x03) << 8) | props[1]  # 10 bits
     has_subpkg = (props[0] & 0x20) != 0
@@ -133,7 +141,12 @@ class Flow:
         return self._v.to_bytes(2, "big")
 
 
-def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, body: bytes = b""):
+def build_downlink(
+    msg_id: bytes,
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    body: bytes = b"",
+):
     header = msg_id + build_props(len(body)) + phone_bcd + flow_id_platform
     frame = header + body
     cs = bytes([checksum(frame)])
@@ -142,16 +155,26 @@ def build_downlink(msg_id: bytes, phone_bcd: bytes, flow_id_platform: bytes, bod
 
 
 # 0x8001 – Platform general response
-def build_0x8001(phone_bcd: bytes, flow_id_platform: bytes,
-                 orig_flow_id: bytes, orig_msg_id: bytes, result: int):
+def build_0x8001(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    orig_flow_id: bytes,
+    orig_msg_id: bytes,
+    result: int,
+):
     # Body: resp_flowId (WORD) + resp_msgId (WORD) + result (BYTE)
     body = orig_flow_id + orig_msg_id + bytes([result])
     return build_downlink(b"\x80\x01", phone_bcd, flow_id_platform, body)
 
 
 # 0x8100 – Register response
-def build_0x8100(phone_bcd: bytes, flow_id_platform: bytes,
-                 orig_flow_id: bytes, result: int = 0, auth_code: bytes = b""):
+def build_0x8100(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    orig_flow_id: bytes,
+    result: int = 0,
+    auth_code: bytes = b"",
+):
     # Body: flowId (WORD) + result (BYTE) + auth_code (n)
     body = orig_flow_id + bytes([result]) + auth_code
     return build_downlink(b"\x81\x00", phone_bcd, flow_id_platform, body)
@@ -191,7 +214,6 @@ def handle_0002_heartbeat(session, hdr, body):
 def handle_0100_register(session, hdr, body):
     """
     0x0100 – Registro terminal
-    no hace falta parsear todo para la prueba, pero lo intentamos
     """
     try:
         prov = int.from_bytes(body[0:2], "big")
@@ -200,7 +222,11 @@ def handle_0100_register(session, hdr, body):
         model = body[9:29].decode("ascii", errors="ignore").strip()
         term_id = body[29:36].decode("ascii", errors="ignore").strip()
         plate_color = body[36] if len(body) > 36 else None
-        plate = body[37:].decode("ascii", errors="ignore").strip() if len(body) > 37 else ""
+        plate = (
+            body[37:].decode("ascii", errors="ignore").strip()
+            if len(body) > 37
+            else ""
+        )
         logger.info(
             f"[0100] Registro terminal phone={hdr['phone_str']} "
             f"prov={prov} city={city} manu={manu!r} model={model!r} "
@@ -208,7 +234,10 @@ def handle_0100_register(session, hdr, body):
         )
     except Exception as e:
         logger.exception(f"Error parseando 0x0100: {e}")
-        logger.info(f"[0100] Registro terminal phone={hdr['phone_str']} (body_len={len(body)})")
+        logger.info(
+            f"[0100] Registro terminal phone={hdr['phone_str']} "
+            f"(body_len={len(body)})"
+        )
 
     # Registro aceptado (result=0)
     return build_0x8100(
@@ -237,11 +266,52 @@ def handle_0102_auth(session, hdr, body):
     )
 
 
+def handle_0200_position(session, hdr, body):
+    """
+    0x0200 – LocationReport
+    Campos básicos: alarm(4) + status(4) + lat(4) + lon(4) + alt(2) + speed(2) + course(2) + time(6 BCD)
+    """
+    try:
+        if len(body) < 28:
+            logger.warning(
+                f"[0200] body demasiado corto: len={len(body)} phone={hdr['phone_str']}"
+            )
+        else:
+            alarm = int.from_bytes(body[0:4], "big")
+            status = int.from_bytes(body[4:8], "big")
+            lat = parse_coord_u32(body[8:12])
+            lon = parse_coord_u32(body[12:16])
+            alt = int.from_bytes(body[16:18], "big", signed=False)
+            speed = int.from_bytes(body[18:20], "big", signed=False) / 10.0
+            course = int.from_bytes(body[20:22], "big", signed=False)
+            dt = parse_time_bcd6(body[22:28])
+
+            logger.info(
+                f"[0200] phone={hdr['phone_str']} "
+                f"alarm={alarm} status={status} "
+                f"lat={lat:.6f} lon={lon:.6f} alt={alt}m "
+                f"speed={speed:.1f}km/h course={course} "
+                f"time={dt.isoformat()}"
+            )
+    except Exception as e:
+        logger.exception(f"Error parseando 0x0200: {e}")
+
+    # Devolvemos ACK general OK
+    return build_0x8001(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        hdr["flow_id"],
+        hdr["msg_id"],
+        0,
+    )
+
+
 MSG_HANDLERS = {
     b"\x00\x01": handle_0001_terminal_general_resp,
     b"\x00\x02": handle_0002_heartbeat,
     b"\x01\x00": handle_0100_register,
     b"\x01\x02": handle_0102_auth,
+    b"\x02\x00": handle_0200_position,  # <- ahora ya manejamos 0x0200
 }
 
 
