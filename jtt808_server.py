@@ -79,6 +79,26 @@ def parse_coord_u32(raw: bytes) -> float:
     v = int.from_bytes(raw, 'big', signed=False)
     return v / 1_000_000.0
 
+def _to_bcd_byte(v: int) -> int:
+    """
+    Convierte un entero 0-99 en un byte BCD (ej. 23 -> 0x23).
+    """
+    v = max(0, min(99, int(v)))
+    return ((v // 10) << 4) | (v % 10)
+
+
+def encode_time_bcd6(dt: datetime | None) -> bytes:
+    """
+    Codifica datetime a BCD[6] YYMMDDhhmmss.
+    Si dt es None, devuelve 6 bytes 0x00 (sin condición de tiempo).
+    """
+    if dt is None:
+        return b"\x00" * 6
+
+    yy = dt.year % 100
+    vals = (yy, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+    return bytes(_to_bcd_byte(v) for v in vals)
+
 
 # === Logger ===
 logger = logging.getLogger("jtt808")
@@ -105,30 +125,6 @@ pos_fh = RotatingFileHandler("jtt808_pos.jsonl", maxBytes=10_000_000, backupCoun
 pos_logger.addHandler(pos_fh)
 # Igual: solo archivo, no consola
 pos_logger.propagate = False
-
-
-# === Diccionario de nombres de mensajes (para logs más claros) ===
-MSG_NAMES = {
-    b'\x00\x01': "TerminalGeneralResp",
-    b'\x00\x02': "TerminalHeartbeat",
-    b'\x01\x00': "TerminalRegister",
-    b'\x01\x02': "TerminalAuth",
-    b'\x02\x00': "LocationReport",
-    b'\x02\x01': "LocationQueryResp",
-    b'\x07\x04': "BatchLocationUpload",
-
-    b'\x80\x01': "PlatformGeneralResp",
-    b'\x81\x00': "RegisterResp",
-    b'\x82\x01': "LocationQuery",
-    b'\x82\x02': "TempTrackingControl",
-
-    b'\x91\x01': "AVStartReq",
-    b'\x91\x02': "AVControl",
-}
-
-
-def msg_name(msg_id: bytes) -> str:
-    return MSG_NAMES.get(msg_id, "UNKNOWN")
 
 
 # === Header 808 (2013) ===
@@ -252,6 +248,64 @@ def build_0x9102(phone_bcd: bytes, flow_id_platform: bytes,
     body += switch_stream_type.to_bytes(2, 'big')
     return build_downlink(b'\x91\x02', phone_bcd, flow_id_platform, bytes(body))
 
+# 0x9105 – Real-time AV transmission status notification
+def build_0x9105_av_status_notify(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    logical_channel: int,
+    packet_loss_rate: int,
+):
+    """
+    logical_channel: número de canal lógico (según tabla de canales del fabricante)
+    packet_loss_rate: 0-100, porcentaje (la norma dice *valor *100 e int*, pero
+                      en la práctica se maneja 0-100 y el terminal lo interpreta).
+    """
+    pl = max(0, min(100, int(packet_loss_rate)))
+    body = bytearray()
+    body.append(logical_channel & 0xFF)
+    body.append(pl & 0xFF)
+    return build_downlink(b'\x91\x05', phone_bcd, flow_id_platform, bytes(body))
+
+# 0x9301 – PTZ rotation
+def build_0x9301_ptz_rotate(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    logical_channel: int,
+    direction: int,
+    speed: int,
+):
+    """
+    direction:
+      0 = stop
+      1 = up
+      2 = down
+      3 = left
+      4 = right
+    speed: 0-255
+    """
+    body = bytearray()
+    body.append(logical_channel & 0xFF)
+    body.append(direction & 0xFF)
+    body.append(max(0, min(255, speed)) & 0xFF)
+    return build_downlink(b'\x93\x01', phone_bcd, flow_id_platform, bytes(body))
+
+# 0x9302 – PTZ focus control
+def build_0x9302_ptz_focus(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    logical_channel: int,
+    focus_direction: int,
+):
+    """
+    focus_direction (según implementaciones típicas):
+      0 = far / enfocar lejos
+      1 = near / enfocar cerca
+    """
+    body = bytearray()
+    body.append(logical_channel & 0xFF)
+    body.append(focus_direction & 0xFF)
+    return build_downlink(b'\x93\x02', phone_bcd, flow_id_platform, bytes(body))
+
 
 # === Handlers uplink ===
 def handle_0001_terminal_general_resp(session, hdr, body):
@@ -265,11 +319,9 @@ def handle_0001_terminal_general_resp(session, hdr, body):
     resp_flow = int.from_bytes(body[0:2], 'big')
     resp_msg_id = body[2:4]
     result = body[4]
-    resp_name = msg_name(resp_msg_id)
     logger.info(
         f"[0001] Ack terminal phone={hdr['phone_str']} "
-        f"resp_flow={resp_flow} resp_msgId=0x{resp_msg_id.hex()} ({resp_name}) "
-        f"result={result}"
+        f"resp_flow={resp_flow} resp_msgId=0x{resp_msg_id.hex()} result={result}"
     )
     # Normalmente NO se responde nada a 0x0001
     return None
@@ -519,8 +571,8 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
     )
     logger.info(
         f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x9101 ({msg_name(b'\\x91\\x01')}) "
-        f"ch={VIDEO_CHANNEL} to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT}"
+        f"msgId=0x9101 (StartAV ch={VIDEO_CHANNEL} "
+        f"to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT})"
     )
     writer.write(av)
     await writer.drain()
@@ -535,7 +587,7 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
     )
     logger.info(
         f"[TX srv->term] phone={hdr['phone_str']} "
-        f"msgId=0x9102 ({msg_name(b'\\x91\\x02')}) START ch={VIDEO_CHANNEL}"
+        f"msgId=0x9102 (AVControl START ch={VIDEO_CHANNEL})"
     )
     writer.write(av_ctrl)
     await writer.drain()
@@ -600,9 +652,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         hex_payload,
                     )
 
-                    mname = msg_name(hdr["msg_id"])
                     logger.info(
-                        f"[RX term->srv] msgId=0x{hdr['msg_id'].hex()} ({mname}) "
+                        f"[RX term->srv] msgId=0x{hdr['msg_id'].hex()} "
                         f"phone={hdr['phone_str']} body_len={hdr['body_len']} "
                         f"has_subpkg={hdr['has_subpkg']}"
                     )
@@ -612,10 +663,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if handler:
                         resp = handler(session, hdr, body)
                         if resp:
-                            # Para la respuesta, sabemos que es 0x8001 o 0x8100 o similar.
                             logger.info(
                                 f"[TX srv->term] phone={hdr['phone_str']} "
-                                f"resp_for=0x{hdr['msg_id'].hex()} ({mname}) "
+                                f"resp_for=0x{hdr['msg_id'].hex()} "
                                 f"flow={int.from_bytes(hdr['flow_id'], 'big')}"
                             )
                             writer.write(resp)
@@ -627,7 +677,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 cmd = build_0x8201(hdr["phone_bcd"], session.next_flow())
                                 logger.info(
                                     f"[TX srv->term] phone={hdr['phone_str']} "
-                                    f"msgId=0x8201 ({msg_name(b'\\x82\\x01')})"
+                                    f"msgId=0x8201 (LocationQuery)"
                                 )
                                 writer.write(cmd)
                                 await writer.drain()
@@ -639,8 +689,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 )
                                 logger.info(
                                     f"[TX srv->term] phone={hdr['phone_str']} "
-                                    f"msgId=0x8202 ({msg_name(b'\\x82\\x02')}) "
-                                    f"{TEMP_TRACK_INTERVAL_S}s x {TEMP_TRACK_DURATION_MIN}min"
+                                    f"msgId=0x8202 (TempTracking "
+                                    f"{TEMP_TRACK_INTERVAL_S}s x {TEMP_TRACK_DURATION_MIN}min)"
                                 )
                                 writer.write(cmd2)
                                 await writer.drain()
@@ -659,7 +709,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                     else:
                         logger.info(
-                            f"MsgId no manejado: 0x{msg_id.hex()} ({msg_name(msg_id)}) "
+                            f"MsgId no manejado: 0x{msg_id.hex()} "
                             f"phone={hdr['phone_str']} len={hdr['body_len']}"
                         )
                         if ALWAYS_ACK_UNKNOWN:
@@ -672,8 +722,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             )
                             logger.info(
                                 f"[TX srv->term] phone={hdr['phone_str']} "
-                                f"msgId=0x8001 ({msg_name(b'\\x80\\x01')}) "
-                                f"(Ack UNKNOWN 0x{hdr['msg_id'].hex()})"
+                                f"msgId=0x8001 (Ack UNKNOWN 0x{hdr['msg_id'].hex()})"
                             )
                             writer.write(resp)
                             await writer.drain()
