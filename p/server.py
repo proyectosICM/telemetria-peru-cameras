@@ -4,7 +4,7 @@
 #   - Auth (0x0102)
 #   - Heartbeat (0x0002)
 #   - Posición (0x0200)
-#   - Arranque de video (0x9101 / 0x9102) y escucha UDP de A/V
+#   - Arranque de video (0x9101 / 0x9102) tras auth en el MISMO puerto 6808
 
 import asyncio
 import binascii
@@ -19,13 +19,13 @@ PORT = 6808
 ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
 
 # ========== Config de video / AV (JT/T 1078) ==========
-# IP a la que el DVR enviará video. Normalmente la IP pública del servidor.
-VIDEO_TARGET_IP = "38.43.134.172"  # <-- cámbiala si hace falta
-VIDEO_TCP_PORT = 7200              # puerto TCP que le diremos al DVR (aunque aquí usamos UDP)
-VIDEO_UDP_PORT = 7200              # puerto donde este mismo script escuchará paquetes A/V
+# Estos valores van DENTRO del 0x9101. Aquí no abrimos ningún puerto extra.
+VIDEO_TARGET_IP = "38.43.134.172"  # IP que el DVR usará como destino del stream
+VIDEO_TCP_PORT = 7200              # puerto TCP destino que verá el terminal
+VIDEO_UDP_PORT = 7200              # puerto UDP destino (para más adelante montar media-server)
 VIDEO_CHANNEL = 1                  # canal lógico del DVR
-VIDEO_DATA_TYPE = 1                # 0=audio+video, 1=solo video, etc. depende del fabricante
-VIDEO_FRAME_TYPE = 0               # 0=main stream, 1=sub stream
+VIDEO_DATA_TYPE = 1                # 0=a+v, 1=solo video, etc. depende del fabricante
+VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -210,8 +210,8 @@ def build_0x9101(
     body = bytearray()
     body.append(len(ip_bytes))                # IP_len
     body += ip_bytes                          # IP
-    body += tcp_port.to_bytes(2, "big")       # TCP port
-    body += udp_port.to_bytes(2, "big")       # UDP port
+    body += tcp_port.to_bytes(2, "big")       # TCP port destino
+    body += udp_port.to_bytes(2, "big")       # UDP port destino
     body.append(logical_channel & 0xFF)       # logical channel
     body.append(data_type & 0xFF)             # data type
     body.append(frame_type & 0xFF)            # frame type
@@ -425,17 +425,6 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
     await writer.drain()
 
 
-# ========== Protocolo UDP para recibir A/V ==========
-class AVDatagramProtocol(asyncio.DatagramProtocol):
-    def datagram_received(self, data: bytes, addr):
-        # Solo log rápido para ver si llega algo de video
-        preview = data[:32].hex()
-        logger.info(
-            f"[AV-UDP] from {addr} len={len(data)} bytes "
-            f"hex={preview}{'...' if len(data) > 32 else ''}"
-        )
-
-
 # ========== Loop por conexión TCP (808) ==========
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     # Activar TCP keepalive
@@ -559,27 +548,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         logger.info(f"Conexión cerrada {peer}")
 
 
-# ========== main: TCP 808 + UDP A/V en el mismo proceso ==========
+# ========== main: SOLO servidor TCP 6808 ==========
 async def main():
-    loop = asyncio.get_running_loop()
-
-    # Servidor TCP para JT/T 808
     server = await asyncio.start_server(handle_client, HOST, PORT)
     addr = ", ".join(str(s.getsockname()) for s in server.sockets)
     logger.info(f"Servidor JT/T 808 (mínimo) escuchando en {addr}")
-
-    # Servidor UDP para recibir A/V directamente aquí
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: AVDatagramProtocol(),
-        local_addr=("0.0.0.0", VIDEO_UDP_PORT),
-    )
-    logger.info(f"Escuchando A/V UDP en 0.0.0.0:{VIDEO_UDP_PORT}")
-
-    try:
-        async with server:
-            await server.serve_forever()
-    finally:
-        transport.close()
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
