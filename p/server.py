@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# server.py - JT/T 808 minimal (registro + auth + heartbeat + posición) en puerto 6808
+# server.py - JT/T 808 mínimo:
+#   - Registro (0x0100)
+#   - Auth (0x0102)
+#   - Heartbeat (0x0002)
+#   - Posición (0x0200)
+#   - Arranque de video (0x9101 / 0x9102) y escucha UDP de A/V
 
 import asyncio
 import binascii
@@ -12,6 +17,15 @@ HOST = "0.0.0.0"
 PORT = 6808
 
 ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
+
+# ========== Config de video / AV (JT/T 1078) ==========
+# IP a la que el DVR enviará video. Normalmente la IP pública del servidor.
+VIDEO_TARGET_IP = "38.43.134.172"  # <-- cámbiala si hace falta
+VIDEO_TCP_PORT = 7200              # puerto TCP que le diremos al DVR (aunque aquí usamos UDP)
+VIDEO_UDP_PORT = 7200              # puerto donde este mismo script escuchará paquetes A/V
+VIDEO_CHANNEL = 1                  # canal lógico del DVR
+VIDEO_DATA_TYPE = 1                # 0=audio+video, 1=solo video, etc. depende del fabricante
+VIDEO_FRAME_TYPE = 0               # 0=main stream, 1=sub stream
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -180,6 +194,47 @@ def build_0x8100(
     return build_downlink(b"\x81\x00", phone_bcd, flow_id_platform, body)
 
 
+# ========== JT/T 1078 sobre JT808: comandos de video ==========
+# 0x9101 – Real-time audio and video transmit request
+def build_0x9101(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    ip: str,
+    tcp_port: int,
+    udp_port: int,
+    logical_channel: int,
+    data_type: int = 1,      # 0=a+v, 1=solo video
+    frame_type: int = 0,     # 0=main, 1=sub
+):
+    ip_bytes = ip.encode("ascii")
+    body = bytearray()
+    body.append(len(ip_bytes))                # IP_len
+    body += ip_bytes                          # IP
+    body += tcp_port.to_bytes(2, "big")       # TCP port
+    body += udp_port.to_bytes(2, "big")       # UDP port
+    body.append(logical_channel & 0xFF)       # logical channel
+    body.append(data_type & 0xFF)             # data type
+    body.append(frame_type & 0xFF)            # frame type
+    return build_downlink(b"\x91\x01", phone_bcd, flow_id_platform, bytes(body))
+
+
+# 0x9102 – Real-time AV transmit control
+def build_0x9102(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    logical_channel: int,
+    control_cmd: int = 1,   # 0=stop, 1=start, etc.
+    close_av_type: int = 0,
+    switch_stream_type: int = 0,
+):
+    body = bytearray()
+    body.append(logical_channel & 0xFF)
+    body.append(control_cmd & 0xFF)
+    body += close_av_type.to_bytes(2, "big")
+    body += switch_stream_type.to_bytes(2, "big")
+    return build_downlink(b"\x91\x02", phone_bcd, flow_id_platform, bytes(body))
+
+
 # ========== Handlers uplink mínimos ==========
 def handle_0001_terminal_general_resp(session, hdr, body):
     """
@@ -311,7 +366,7 @@ MSG_HANDLERS = {
     b"\x00\x02": handle_0002_heartbeat,
     b"\x01\x00": handle_0100_register,
     b"\x01\x02": handle_0102_auth,
-    b"\x02\x00": handle_0200_position,  # <- ahora ya manejamos 0x0200
+    b"\x02\x00": handle_0200_position,  # posición
 }
 
 
@@ -319,12 +374,69 @@ MSG_HANDLERS = {
 class SessionState:
     def __init__(self):
         self.flow = Flow()
+        self.video_started = False  # para no enviar 0x9101/0x9102 más de una vez
 
     def next_flow(self) -> bytes:
         return self.flow.next()
 
 
-# ========== Loop por conexión ==========
+# ========== Envío comandos de video ==========
+async def start_video_if_needed(session: SessionState, hdr, writer):
+    """
+    Envía 0x9101 + 0x9102 una sola vez por sesión.
+    """
+    if session.video_started:
+        return
+
+    session.video_started = True
+
+    # 0x9101 – Start AV
+    av = build_0x9101(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        ip=VIDEO_TARGET_IP,
+        tcp_port=VIDEO_TCP_PORT,
+        udp_port=VIDEO_UDP_PORT,
+        logical_channel=VIDEO_CHANNEL,
+        data_type=VIDEO_DATA_TYPE,
+        frame_type=VIDEO_FRAME_TYPE,
+    )
+    logger.info(
+        f"[TX] phone={hdr['phone_str']} msgId=0x9101 "
+        f"(StartAV ch={VIDEO_CHANNEL} to {VIDEO_TARGET_IP}:TCP={VIDEO_TCP_PORT}/UDP={VIDEO_UDP_PORT})"
+    )
+    writer.write(av)
+    await writer.drain()
+
+    # 0x9102 – AV control START (muchos equipos lo exigen además del 0x9101)
+    av_ctrl = build_0x9102(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        logical_channel=VIDEO_CHANNEL,
+        control_cmd=1,               # START
+        close_av_type=0,
+        switch_stream_type=VIDEO_FRAME_TYPE,
+    )
+    logger.info(
+        f"[TX] phone={hdr['phone_str']} msgId=0x9102 "
+        f"(AVControl START ch={VIDEO_CHANNEL})"
+    )
+    writer.write(av_ctrl)
+    await writer.drain()
+
+
+# ========== Protocolo UDP para recibir A/V ==========
+class AVDatagramProtocol(asyncio.DatagramProtocol):
+    def datagram_received(self, data: bytes, addr):
+        # Solo log rápido para ver si llega algo de video
+        preview = data[:32].hex()
+        logger.info(
+            f"[AV-UDP] from {addr} len={len(data)} bytes "
+            f"hex={preview}{'...' if len(data) > 32 else ''}"
+        )
+
+
+# ========== Loop por conexión TCP (808) ==========
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     # Activar TCP keepalive
     sock = writer.get_extra_info("socket")
@@ -400,6 +512,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             )
                             writer.write(resp)
                             await writer.drain()
+
+                        # Después de AUTH (0x0102) arrancamos el video
+                        if msg_id == b"\x01\x02":
+                            await start_video_if_needed(session, hdr, writer)
+
+                        # Fallback: si por alguna razón no arrancó y ya manda 0x0200, arrancamos ahí
+                        if msg_id == b"\x02\x00" and not session.video_started:
+                            logger.info(
+                                f"[VIDEO] trigger por 0x0200 phone={hdr['phone_str']}, "
+                                f"enviando 0x9101/0x9102"
+                            )
+                            await start_video_if_needed(session, hdr, writer)
+
                     else:
                         logger.info(
                             f"MsgId no manejado: 0x{msg_id.hex()} "
@@ -434,13 +559,27 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         logger.info(f"Conexión cerrada {peer}")
 
 
-# ========== main ==========
+# ========== main: TCP 808 + UDP A/V en el mismo proceso ==========
 async def main():
+    loop = asyncio.get_running_loop()
+
+    # Servidor TCP para JT/T 808
     server = await asyncio.start_server(handle_client, HOST, PORT)
     addr = ", ".join(str(s.getsockname()) for s in server.sockets)
     logger.info(f"Servidor JT/T 808 (mínimo) escuchando en {addr}")
-    async with server:
-        await server.serve_forever()
+
+    # Servidor UDP para recibir A/V directamente aquí
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: AVDatagramProtocol(),
+        local_addr=("0.0.0.0", VIDEO_UDP_PORT),
+    )
+    logger.info(f"Escuchando A/V UDP en 0.0.0.0:{VIDEO_UDP_PORT}")
+
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        transport.close()
 
 
 if __name__ == "__main__":
