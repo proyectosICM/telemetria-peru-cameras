@@ -14,7 +14,7 @@ Hace esto:
   - Loguea TODO en hex (logger normal + logger.raw)
   - Guarda TODO el stream crudo (login + video) en archivo por conexión
   - Además, extrae el H.264 (Annex B) del stream y lo envía a un FIFO:
-        /tmp/000012345678_1.h264
+        /tmp/<phone>_<canal>.h264
     para que ffmpeg lo sirva por HTTP (puerto 2000, etc.)
 """
 
@@ -22,6 +22,8 @@ import asyncio
 import binascii
 import logging
 import socket
+import os
+import stat
 from datetime import datetime
 
 # ========== Config básica ==========
@@ -32,19 +34,15 @@ ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
 
 # ========== Config de video / AV (JT/T 1078) ==========
 # Le pedimos al terminal que envíe el video a ESTA IP/puerto.
-# Es el mismo host/puerto donde ya está conectando (ajusta la IP si hace falta).
 VIDEO_TARGET_IP = "38.43.134.172"  # tu IP pública
 VIDEO_TCP_PORT = 7200              # mismo puerto 7200
 VIDEO_UDP_PORT = 7200              # si usa UDP, también 7200
-VIDEO_CHANNEL = 1                  # canal lógico
-VIDEO_DATA_TYPE = 1                # 0=audio+video, 1=solo video
+VIDEO_CHANNEL = 1                  # canal lógico por defecto que usaremos
+VIDEO_DATA_TYPE = 1                # 0=a+v, 1=solo video
 VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
 
-# ========== FIFO H.264 para ffmpeg ==========
-# Por ahora hardcodeado a un solo dispositivo/canal: 000012345678_1
-# Debes crear el FIFO antes de ejecutar el script:
-#   mkfifo /tmp/000012345678_1.h264
-H264_PIPE_PATH = "/tmp/000012345678_1.h264"
+# Directorio base para los FIFOs de video
+H264_PIPE_DIR = "/tmp"
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -394,26 +392,85 @@ class SessionState:
         self.flow = Flow()
         self.video_started = False  # para no mandar 9101/9102 más de una vez
 
-        # Para extraer H.264 y mandarlo al FIFO
+        # Datos para H.264 -> FIFO
+        self.phone_str = None
+        self.pipe_path = None
         self.h264_started = False       # ya encontré el primer SPS (00 00 01 67)
         self.h264_pipe = None
-        self.h264_pipe_failed = False   # si falla abrir el FIFO, no reintentar en bucle
+        self.h264_pipe_failed = False   # si falla escribir, no reintentar en bucle
         self._tail3 = b""               # últimas 3 bytes para capturar patrones en bordes
 
     def next_flow(self) -> bytes:
         return self.flow.next()
 
+    # --- manejo de FIFOs por dispositivo ---
+    def ensure_phone_and_pipes(self, phone_str: str):
+        """
+        Se llama cuando ya conocemos el phone_str (del header 808).
+        Crea los FIFOs /tmp/<phone>_1.h264 ... /tmp/<phone>_8.h264 solo una vez.
+        """
+        if self.phone_str is not None:
+            return  # ya inicializado
+
+        self.phone_str = phone_str
+        logger.info(f"[H264] Inicializando FIFOs para phone={phone_str}")
+
+        # Crear 8 canales
+        for ch in range(1, 9):
+            path = os.path.join(H264_PIPE_DIR, f"{phone_str}_{ch}.h264")
+            try:
+                st = os.stat(path)
+                if stat.S_ISFIFO(st.st_mode):
+                    logger.info(f"[H264] FIFO ya existía: {path}")
+                else:
+                    logger.warning(
+                        f"[H264] {path} existe y no es FIFO, se deja tal cual"
+                    )
+            except FileNotFoundError:
+                try:
+                    os.mkfifo(path, 0o666)
+                    logger.info(f"[H264] FIFO creado: {path}")
+                except FileExistsError:
+                    logger.info(f"[H264] FIFO ya existía (race): {path}")
+                except Exception as e:
+                    logger.warning(f"[H264] No se pudo crear FIFO {path}: {e}")
+
+        # Usamos por ahora un solo canal de video (VIDEO_CHANNEL)
+        self.pipe_path = os.path.join(
+            H264_PIPE_DIR, f"{phone_str}_{VIDEO_CHANNEL}.h264"
+        )
+        logger.info(f"[H264] Canal de video principal: {self.pipe_path}")
+
+    def _disable_h264_pipe(self):
+        self.h264_pipe_failed = True
+        if self.h264_pipe is not None:
+            try:
+                self.h264_pipe.close()
+            except Exception:
+                pass
+        self.h264_pipe = None
+        logger.warning("[H264] FIFO deshabilitado para esta sesión (Broken pipe)")
+
     def ensure_h264_pipe(self):
         """
         Abre el FIFO H.264 si aún no está abierto.
+        No hace nada si aún no tenemos phone_str/pipe_path
+        o si ya marcamos h264_pipe_failed.
         """
-        if self.h264_pipe is None and not self.h264_pipe_failed:
+        if self.h264_pipe_failed:
+            return None
+        if self.pipe_path is None:
+            return None
+
+        if self.h264_pipe is None:
             try:
-                self.h264_pipe = open(H264_PIPE_PATH, "wb", buffering=0)
-                logger.info(f"[H264] FIFO abierto para escritura: {H264_PIPE_PATH}")
+                # Ojo: esto puede bloquear si no hay lector (ffmpeg)
+                self.h264_pipe = open(self.pipe_path, "wb", buffering=0)
+                logger.info(f"[H264] FIFO abierto para escritura: {self.pipe_path}")
             except Exception as e:
-                logger.warning(f"[H264] No se pudo abrir FIFO {H264_PIPE_PATH}: {e}")
+                logger.warning(f"[H264] No se pudo abrir FIFO {self.pipe_path}: {e}")
                 self.h264_pipe_failed = True
+                self.h264_pipe = None
         return self.h264_pipe
 
     def feed_h264(self, chunk: bytes):
@@ -424,38 +481,42 @@ class SessionState:
         IMPORTANTE:
         - No interpreta JT1078 todavía, solo busca el patrón H.264 en bruto.
         - Asume que el MDVR está mandando H.264 dentro del stream.
+        - Si aún no tenemos phone_str/pipe_path, no hace nada.
         """
+        if self.pipe_path is None or self.h264_pipe_failed:
+            return
+
         data = self._tail3 + chunk
 
-        # Si aún no encontramos el primer SPS, lo buscamos
-        if not self.h264_started:
-            idx = data.find(b"\x00\x00\x01\x67")
-            if idx != -1:
-                self.h264_started = True
+        try:
+            # Si aún no encontramos el primer SPS, lo buscamos
+            if not self.h264_started:
+                idx = data.find(b"\x00\x00\x01\x67")
+                if idx != -1:
+                    self.h264_started = True
+                    pipe = self.ensure_h264_pipe()
+                    if pipe is not None:
+                        pipe.write(data[idx:])
+            else:
+                # Ya estamos en modo “H.264 streaming”: mandar chunk tal cual
                 pipe = self.ensure_h264_pipe()
                 if pipe is not None:
-                    try:
-                        pipe.write(data[idx:])
-                    except Exception as e:
-                        logger.warning(f"[H264] Error escribiendo en FIFO: {e}")
-                else:
-                    logger.warning("[H264] FIFO no disponible, no se escribe H.264")
-        else:
-            # Ya estamos en modo “H.264 streaming”: mandar chunk tal cual
-            pipe = self.ensure_h264_pipe()
-            if pipe is not None:
-                try:
                     pipe.write(chunk)
-                except Exception as e:
-                    logger.warning(f"[H264] Error escribiendo en FIFO: {e}")
-            else:
-                logger.warning("[H264] FIFO no disponible, no se escribe H.264")
+        except BrokenPipeError as e:
+            logger.warning(
+                f"[H264] Error Broken pipe en FIFO {self.pipe_path}: {e}"
+            )
+            self._disable_h264_pipe()
+        except Exception as e:
+            logger.warning(f"[H264] Error escribiendo en FIFO {self.pipe_path}: {e}")
 
         # Guardar últimas 3 bytes para concatenarlas con el siguiente chunk
         if len(data) >= 3:
             self._tail3 = data[-3:]
         else:
             self._tail3 = data
+
+    # --- fin manejo FIFOs ---
 
 
 async def start_video_if_needed(session: SessionState, hdr, writer):
@@ -539,12 +600,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception as e:
                     logger.warning(f"[FILE] Error escribiendo en {dump_filename}: {e}")
 
-            # Alimentar el extractor de H.264 para el FIFO (ffmpeg)
-            try:
-                session.feed_h264(chunk)
-            except Exception as e:
-                logger.warning(f"[H264] Error en feed_h264: {e}")
-
+            # OJO: NO llamamos feed_h264 aquí hasta conocer el phone_str
             buf += chunk
 
             # buscar frames 0x7E ... 0x7E (solo para JT808)
@@ -564,12 +620,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if len(payload) < 13:
                         continue
 
+                    # Checksum: si falla, no spameamos WARNING, solo ignoramos
                     calc = checksum(payload[:-1])
                     if calc != payload[-1]:
-                        logger.warning("[CHK] Checksum inválido, descartando frame")
+                        # logger.debug("[CHK] Checksum inválido, descartando frame")
                         continue
 
                     hdr = parse_header(payload[:-1])
+
+                    # En cuanto conocemos phone_str, creamos FIFOs (8 canales)
+                    session.ensure_phone_and_pipes(hdr["phone_str"])
+
                     body = payload[:-1][
                         hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]
                     ]
@@ -633,6 +694,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                 except Exception as ex:
                     logger.exception(f"[ERR] Error manejando frame: {ex}")
+
+            # Ahora que probablemente ya tenemos phone_str/pipe_path,
+            # alimentamos el extractor H.264 con el chunk crudo
+            try:
+                session.feed_h264(chunk)
+            except Exception as e:
+                logger.warning(f"[H264] Error en feed_h264: {e}")
 
     except Exception as e:
         logger.exception(f"[ERR] Error en conexión {peer}: {e}")
