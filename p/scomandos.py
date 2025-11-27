@@ -23,7 +23,7 @@ ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
 # ========== Config de video / AV (JT/T 1078) ==========
 VIDEO_TARGET_IP = "38.43.134.172"  # IP pública del servidor donde escucharás el stream
 VIDEO_TCP_PORT = 7200              # puerto TCP destino que verá el terminal
-VIDEO_UDP_PORT = 7200              # puerto UDP destino (si lo usas)
+VIDEO_UDP_PORT = 0              # puerto UDP destino (si lo usas)
 VIDEO_CHANNEL = 1                  # canal lógico del DVR
 VIDEO_DATA_TYPE = 1                # 0=a+v, 1=solo video, etc. depende del fabricante
 VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
