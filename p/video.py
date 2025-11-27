@@ -29,12 +29,14 @@ import subprocess
 from datetime import datetime
 
 # ========== Config básica ==========
+
 HOST = "0.0.0.0"
 PORT = 7200
 
 ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
 
 # ========== Config de video / AV (JT/T 1078) ==========
+
 # Le pedimos al terminal que envíe el video a ESTA IP/puerto.
 VIDEO_TARGET_IP = "38.43.134.172"  # tu IP pública
 VIDEO_TCP_PORT = 7200              # mismo puerto 7200
@@ -55,6 +57,7 @@ FFMPEG_BIN = "/usr/bin/ffmpeg"  # ajusta si tu ffmpeg está en otra ruta
 FFMPEG_PROCS = {}
 
 # ========== Framing / escape JT808 ==========
+
 START_END = b"\x7e"
 ESC = b"\x7d"
 ESC_MAP = {b"\x02": b"\x7e", b"\x01": b"\x7d"}
@@ -92,6 +95,7 @@ def checksum(data: bytes) -> int:
 
 
 # ========== Helpers BCD / coords ==========
+
 def bcd_to_str(b: bytes) -> str:
     out = ""
     for x in b:
@@ -122,6 +126,7 @@ def parse_coord_u32(raw: bytes) -> float:
 
 
 # ========== Logging simple ==========
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -129,15 +134,8 @@ logging.basicConfig(
 logger = logging.getLogger("video808")
 raw_logger = logging.getLogger("video808.raw")
 
-# ========== Cache de phone por IP ==========
-# Idea: en la conexión "de señal" (donde llegan 0x0100 / 0x0102) aprendemos
-# que la IP X corresponde al phone Y (p.ej., 000012345678).
-# Luego, cualquier otra conexión desde esa IP usará ese mismo phone Y
-# para nombrar FIFOs, en lugar de interpretaciones raras de headers basura.
-LAST_PHONE_BY_IP = {}
-
-
 # ========== Header 808 ==========
+
 def parse_header(payload: bytes):
     """
     payload: header+body SIN checksum
@@ -171,6 +169,7 @@ def parse_header(payload: bytes):
 
 
 # ========== Construcción de downlinks ==========
+
 def build_props(body_len: int, subpkg=False, encrypt=0):
     val = 0
     val |= (body_len & 0x03FF)
@@ -203,6 +202,7 @@ def build_downlink(
 
 
 # 0x8001 – Platform general response
+
 def build_0x8001(
     phone_bcd: bytes,
     flow_id_platform: bytes,
@@ -216,6 +216,7 @@ def build_0x8001(
 
 
 # 0x8100 – Register response
+
 def build_0x8100(
     phone_bcd: bytes,
     flow_id_platform: bytes,
@@ -229,6 +230,7 @@ def build_0x8100(
 
 
 # ========== Comandos de video JT/T 1078 (0x9101 / 0x9102) ==========
+
 def build_0x9101(
     phone_bcd: bytes,
     flow_id_platform: bytes,
@@ -268,6 +270,7 @@ def build_0x9102(
 
 
 # ========== Handlers uplink mínimos ==========
+
 def handle_0001_terminal_general_resp(session, hdr, body):
     """
     0x0001 – Terminal general response
@@ -403,10 +406,11 @@ MSG_HANDLERS = {
 
 
 # ========== Lanzar ffmpeg -> HLS por teléfono/canal ==========
+
 def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
     """
     Lanza (si no está ya lanzado) un ffmpeg que lee del FIFO /tmp/<phone>_<ch>.h264
-    y genera HLS en /var/www/video/<phone>_<ch>.m3u8
+    y genera HLS en /var/www/video/<phone>_<ch>.m3u8 recodificando a H.264 limpio.
     """
     key = f"{phone_str}_{channel}"
 
@@ -427,22 +431,28 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
 
     cmd = [
         FFMPEG_BIN,
-        "-loglevel", "info",
-        "-re",
+        "-loglevel", "warning",
+        "-fflags", "nobuffer",
+        "-flags", "low_delay",
+        "-thread_queue_size", "4096",
         "-i", fifo_path,
-        "-c:v", "copy",
+        # RECODIFICAR A H.264 LIMPIO
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        # HLS
         "-f", "hls",
         "-hls_time", "2",
         "-hls_list_size", "5",
-        "-hls_flags", "delete_segments",
+        "-hls_flags", "delete_segments+append_list",
         m3u8_path,
     ]
 
     try:
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         FFMPEG_PROCS[key] = proc
         logger.info(
-            f"[HLS] Lanzado ffmpeg para phone={phone_str} ch={channel}: "
+            f"[HLS] Lanzado ffmpeg (re-encode) para phone={phone_str} ch={channel}: "
             f"{' '.join(cmd)}"
         )
     except Exception as e:
@@ -450,6 +460,7 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
 
 
 # ========== Estado de sesión ==========
+
 class SessionState:
     def __init__(self):
         self.flow = Flow()
@@ -467,10 +478,12 @@ class SessionState:
         return self.flow.next()
 
     # --- manejo de FIFOs por dispositivo ---
+
     def ensure_phone_and_pipes(self, phone_str: str):
         """
         Se llama cuando ya conocemos el phone_str del terminal.
-        Crea los FIFOs /tmp/<phone>_1.h264 ... /tmp/<phone>_8.h264 solo una vez.
+        Crea los FIFOs /tmp/<phone>_1.h264 ... /tmp/<phone>_8.h264 solo una vez
+        y lanza ffmpeg -> HLS.
         """
         if self.phone_str is not None:
             return  # ya inicializado
@@ -630,6 +643,7 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
 
 
 # ========== Loop por conexión TCP ==========
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     # Activar TCP keepalive
     sock = writer.get_extra_info("socket")
@@ -666,7 +680,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception as e:
                     logger.warning(f"[FILE] Error escribiendo en {dump_filename}: {e}")
 
-            # OJO: NO llamamos feed_h264 aquí hasta conocer el phone_str
+            # OJO: primero acumulamos en el buffer para extraer frames 808
             buf += chunk
 
             # buscar frames 0x7E ... 0x7E (solo para JT808)
@@ -694,22 +708,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                     hdr = parse_header(payload[:-1])
 
-                    # --- Asignar phone a la sesión usando cache por IP ---
-                    peer_ip = None
-                    if isinstance(peer, tuple) and len(peer) >= 1:
-                        peer_ip = peer[0]
-
-                    # Si este mensaje es un REGISTRO o AUTH real, aprendemos el phone para esa IP
-                    if hdr["msg_id"] in (b"\x01\x00", b"\x01\x02") and peer_ip:
-                        LAST_PHONE_BY_IP[peer_ip] = hdr["phone_str"]
-                        logger.info(
-                            f"[PHONE] Aprendido phone={hdr['phone_str']} para IP={peer_ip}"
-                        )
-
-                    # Si la sesión aún no tiene phone, pero ya tenemos uno cacheado para la IP,
-                    # inicializamos los FIFOs con ese phone (p.ej. 000012345678)
-                    if session.phone_str is None and peer_ip and peer_ip in LAST_PHONE_BY_IP:
-                        session.ensure_phone_and_pipes(LAST_PHONE_BY_IP[peer_ip])
+                    # --- Asignar phone a la sesión directamente desde el header ---
+                    if session.phone_str is None:
+                        session.ensure_phone_and_pipes(hdr["phone_str"])
 
                     body = payload[:-1][
                         hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]
@@ -806,6 +807,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 # ========== main: servidor TCP 7200 ==========
+
 async def main():
     server = await asyncio.start_server(handle_client, HOST, PORT)
     addr = ", ".join(str(s.getsockname()) for s in server.sockets)
