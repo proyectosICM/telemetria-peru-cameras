@@ -4,6 +4,9 @@
 #   - Auth (0x0102)
 #   - Heartbeat (0x0002)
 #   - Posición (0x0200)
+#   - Consulta de localización puntual (0x8201 / 0x0201)
+#   - Query de parámetros (0x8104 / 0x0104)
+#   - Set de parámetros (0x8103) con ejemplo para "pulsar" una alarma
 #   - Arranque de video (0x9101 / 0x9102) tras auth en el MISMO puerto 6808
 
 import asyncio
@@ -19,13 +22,17 @@ PORT = 6808
 ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
 
 # ========== Config de video / AV (JT/T 1078) ==========
-# Estos valores van DENTRO del 0x9101. Aquí no abrimos ningún puerto extra.
 VIDEO_TARGET_IP = "38.43.134.172"  # IP que el DVR usará como destino del stream
 VIDEO_TCP_PORT = 7200              # puerto TCP destino que verá el terminal
 VIDEO_UDP_PORT = 7200              # puerto UDP destino (para más adelante montar media-server)
 VIDEO_CHANNEL = 1                  # canal lógico del DVR
 VIDEO_DATA_TYPE = 1                # 0=a+v, 1=solo video, etc. depende del fabricante
 VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
+
+# ========== Parámetro de ejemplo para alarma (cámbialo por el real) ==========
+# Este ID depende 100% del fabricante. Cuando tengas el manual,
+# reemplaza ALARM_PARAM_ID y el formato del valor según corresponda.
+ALARM_PARAM_ID = 0x00FF0001  # <-- TODO: poner aquí el ID real de parámetro de salida de alarma
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -192,6 +199,36 @@ def build_0x8100(
     # Body: flowId (WORD) + result (BYTE) + auth_code (n)
     body = orig_flow_id + bytes([result]) + auth_code
     return build_downlink(b"\x81\x00", phone_bcd, flow_id_platform, body)
+
+
+# 0x8201 – Location information query (cuerpo vacío)
+def build_0x8201(phone_bcd: bytes, flow_id_platform: bytes):
+    return build_downlink(b"\x82\x01", phone_bcd, flow_id_platform, b"")
+
+
+# 0x8104 – Query terminal parameters
+def build_0x8104(phone_bcd: bytes, flow_id_platform: bytes):
+    # cuerpo vacío
+    return build_downlink(b"\x81\x04", phone_bcd, flow_id_platform, b"")
+
+
+# 0x8103 – Set terminal parameters (genérico)
+def build_0x8103_single_param(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    param_id: int,
+    value_bytes: bytes,
+):
+    """
+    Construye un 0x8103 con UN solo parámetro:
+    body = param_count(1) + param_id(4) + len(1) + value_bytes
+    """
+    body = bytearray()
+    body.append(1)  # param_count = 1
+    body += param_id.to_bytes(4, "big")
+    body.append(len(value_bytes))
+    body += value_bytes
+    return build_downlink(b"\x81\x03", phone_bcd, flow_id_platform, bytes(body))
 
 
 # ========== JT/T 1078 sobre JT808: comandos de video ==========
@@ -361,12 +398,107 @@ def handle_0200_position(session, hdr, body):
     )
 
 
+def handle_0201_location_query_resp(session, hdr, body):
+    """
+    0x0201 – Respuesta a 0x8201 (consulta de localización)
+    body: resp_flowId(2) + [estructura tipo 0x0200]
+    """
+    try:
+        if len(body) >= 2:
+            resp_flow = int.from_bytes(body[0:2], "big")
+            rest = body[2:]
+        else:
+            resp_flow = None
+            rest = body
+
+        if len(rest) < 28:
+            logger.info(
+                f"[0201] resp_flow={resp_flow} body_len={len(body)} "
+                f"(no hay suficientes bytes para posición completa)"
+            )
+        else:
+            alarm = int.from_bytes(rest[0:4], "big")
+            status = int.from_bytes(rest[4:8], "big")
+            lat = parse_coord_u32(rest[8:12])
+            lon = parse_coord_u32(rest[12:16])
+            alt = int.from_bytes(rest[16:18], "big", signed=False)
+            speed = int.from_bytes(rest[18:20], "big", signed=False) / 10.0
+            course = int.from_bytes(rest[20:22], "big", signed=False)
+            dt = parse_time_bcd6(rest[22:28])
+
+            logger.info(
+                f"[0201] resp_flow={resp_flow} phone={hdr['phone_str']} "
+                f"alarm={alarm} status={status} "
+                f"lat={lat:.6f} lon={lon:.6f} alt={alt}m "
+                f"speed={speed:.1f}km/h course={course} "
+                f"time={dt.isoformat()}"
+            )
+    except Exception as e:
+        logger.exception(f"Error parseando 0x0201: {e}")
+
+    # ACK general
+    return build_0x8001(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        hdr["flow_id"],
+        hdr["msg_id"],
+        0,
+    )
+
+
+def handle_0104_query_param_resp(session, hdr, body):
+    """
+    0x0104 – Query Terminal Parameters Response
+    body: param_count(1) + [ param_id(4) + len(1) + value(len) ]*
+    """
+    if not body:
+        logger.info(f"[0104] body vacío phone={hdr['phone_str']}")
+        return None
+
+    param_count = body[0]
+    idx = 1
+    logger.info(
+        f"[0104] phone={hdr['phone_str']} param_count={param_count} body_len={len(body)}"
+    )
+
+    for i in range(param_count):
+        if idx + 5 > len(body):
+            logger.warning("[0104] no hay bytes suficientes para otro parámetro")
+            break
+
+        param_id = int.from_bytes(body[idx:idx+4], "big")
+        val_len = body[idx+4]
+        idx += 5
+
+        if idx + val_len > len(body):
+            logger.warning("[0104] longitud de valor se sale del body")
+            break
+
+        val = body[idx:idx+val_len]
+        idx += val_len
+
+        logger.info(
+            f"[0104] param[{i}] id=0x{param_id:08X} len={val_len} value_hex={val.hex()}"
+        )
+
+    # ACK general (no hay msg especial de respuesta a 0x0104)
+    return build_0x8001(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        hdr["flow_id"],
+        hdr["msg_id"],
+        0,
+    )
+
+
 MSG_HANDLERS = {
     b"\x00\x01": handle_0001_terminal_general_resp,
     b"\x00\x02": handle_0002_heartbeat,
     b"\x01\x00": handle_0100_register,
     b"\x01\x02": handle_0102_auth,
-    b"\x02\x00": handle_0200_position,  # posición
+    b"\x01\x04": handle_0104_query_param_resp,
+    b"\x02\x00": handle_0200_position,
+    b"\x02\x01": handle_0201_location_query_resp,
 }
 
 
@@ -380,7 +512,8 @@ class SessionState:
         return self.flow.next()
 
 
-# ========== Envío comandos de video ==========
+# ========== Helpers de comandos “activos” ==========
+
 async def start_video_if_needed(session: SessionState, hdr, writer):
     """
     Envía 0x9101 + 0x9102 una sola vez por sesión.
@@ -425,6 +558,48 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
     await writer.drain()
 
 
+async def pulse_alarm(session: SessionState, hdr, writer, duration_seconds: int = 2):
+    """
+    Ejemplo de "pulsar" una alarma usando 0x8103:
+      - Enciende (valor=1) y luego de N segundos la apaga (valor=0).
+
+    IMPORTANTE:
+      - ALARM_PARAM_ID y los value_bytes dependen del fabricante.
+      - Aquí usamos un valor de 1 byte: 0x01 encendido, 0x00 apagado.
+    """
+    logger.info(
+        f"[ALARM] Pulsando alarma phone={hdr['phone_str']} "
+        f"param_id=0x{ALARM_PARAM_ID:08X} dur={duration_seconds}s"
+    )
+
+    # ON
+    value_on = b"\x01"
+    pkt_on = build_0x8103_single_param(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        ALARM_PARAM_ID,
+        value_on,
+    )
+    logger.info(f"[TX] phone={hdr['phone_str']} msgId=0x8103 (ALARM ON)")
+    writer.write(pkt_on)
+    await writer.drain()
+
+    # Espera N segundos
+    await asyncio.sleep(duration_seconds)
+
+    # OFF
+    value_off = b"\x00"
+    pkt_off = build_0x8103_single_param(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        ALARM_PARAM_ID,
+        value_off,
+    )
+    logger.info(f"[TX] phone={hdr['phone_str']} msgId=0x8103 (ALARM OFF)")
+    writer.write(pkt_off)
+    await writer.drain()
+
+
 # ========== Loop por conexión TCP (808) ==========
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     # Activar TCP keepalive
@@ -455,8 +630,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if e == -1:
                     break
 
-                frame = buf[s + 1 : e]  # sin 0x7E
-                buf = buf[e + 1 :]
+                frame = buf[s + 1: e]  # sin 0x7E
+                buf = buf[e + 1:]
 
                 try:
                     payload = de_escape(frame)
@@ -470,7 +645,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                     hdr = parse_header(payload[:-1])
                     body = payload[:-1][
-                        hdr["body_idx"] : hdr["body_idx"] + hdr["body_len"]
+                        hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]
                     ]
 
                     # Log crudo
@@ -502,11 +677,42 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             writer.write(resp)
                             await writer.drain()
 
-                        # Después de AUTH (0x0102) arrancamos el video
+                        # Después de REGISTRO (0x0100), pedimos localización puntual (0x8201)
+                        if msg_id == b"\x01\x00":
+                            cmd_loc = build_0x8201(
+                                hdr["phone_bcd"],
+                                session.next_flow(),
+                            )
+                            logger.info(
+                                f"[TX] phone={hdr['phone_str']} "
+                                f"msgId=0x8201 (LocationQuery tras registro)"
+                            )
+                            writer.write(cmd_loc)
+                            await writer.drain()
+
+                        # Después de AUTH (0x0102):
                         if msg_id == b"\x01\x02":
+                            # 1) Arrancar video (si el equipo lo soporta)
                             await start_video_if_needed(session, hdr, writer)
 
-                        # Fallback: si por alguna razón no arrancó y ya manda 0x0200, arrancamos ahí
+                            # 2) Preguntar parámetros del terminal
+                            q = build_0x8104(
+                                hdr["phone_bcd"],
+                                session.next_flow(),
+                            )
+                            logger.info(
+                                f"[TX] phone={hdr['phone_str']} "
+                                f"msgId=0x8104 (Query terminal params tras auth)"
+                            )
+                            writer.write(q)
+                            await writer.drain()
+
+                            # 3) Opcional: probar un pulso de alarma
+                            #    (solo tendrá efecto real cuando ALARM_PARAM_ID
+                            #     sea el que define el fabricante).
+                            # asyncio.create_task(pulse_alarm(session, hdr, writer, 2))
+
+                        # Fallback: si por alguna razón no arrancó y ya manda 0x0200, arrancamos video ahí
                         if msg_id == b"\x02\x00" and not session.video_started:
                             logger.info(
                                 f"[VIDEO] trigger por 0x0200 phone={hdr['phone_str']}, "
