@@ -5,7 +5,8 @@
 #   - Heartbeat (0x0002)
 #   - Posición (0x0200)
 #   - Solicitud de GPS (0x8201) tras registro
-#   - (Código de video 0x9101/0x9102 definido pero NO usado todavía)
+#   - Arranque de video (0x9101 / 0x9102) DESPUÉS de recibir GPS (0x0201)
+#     indicando al DVR que mande el stream a VIDEO_TARGET_IP:VIDEO_TCP/UDP_PORT
 
 import asyncio
 import binascii
@@ -20,10 +21,9 @@ PORT = 6808
 ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
 
 # ========== Config de video / AV (JT/T 1078) ==========
-# Estos valores van DENTRO del 0x9101. Aquí no abrimos ningún puerto extra.
-VIDEO_TARGET_IP = "38.43.134.172"  # IP que el DVR usaría como destino del stream
-VIDEO_TCP_PORT = 7200              # puerto TCP destino que vería el terminal
-VIDEO_UDP_PORT = 7200              # puerto UDP destino
+VIDEO_TARGET_IP = "38.43.134.172"  # IP pública del servidor donde escucharás el stream
+VIDEO_TCP_PORT = 7200              # puerto TCP destino que verá el terminal
+VIDEO_UDP_PORT = 7200              # puerto UDP destino (si lo usas)
 VIDEO_CHANNEL = 1                  # canal lógico del DVR
 VIDEO_DATA_TYPE = 1                # 0=a+v, 1=solo video, etc. depende del fabricante
 VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
@@ -435,11 +435,11 @@ class SessionState:
         return self.flow.next()
 
 
-# ========== Envío comandos de video (DEFINIDO, NO USADO AÚN) ==========
+# ========== Envío comandos de video ==========
 async def start_video_if_needed(session: SessionState, hdr, writer):
     """
     Envía 0x9101 + 0x9102 una sola vez por sesión.
-    AHORA MISMO NO SE LLAMA (solo GPS).
+    Indica al DVR que envíe el stream a VIDEO_TARGET_IP:VIDEO_TCP/UDP_PORT.
     """
     if session.video_started:
         return
@@ -511,8 +511,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if e == -1:
                     break
 
-                frame = buf[s + 1 : e]  # sin 0x7E
-                buf = buf[e + 1 :]
+                frame = buf[s + 1: e]  # sin 0x7E
+                buf = buf[e + 1:]
 
                 try:
                     payload = de_escape(frame)
@@ -526,7 +526,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                     hdr = parse_header(payload[:-1])
                     body = payload[:-1][
-                        hdr["body_idx"] : hdr["body_idx"] + hdr["body_len"]
+                        hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]
                     ]
 
                     # Log crudo
@@ -558,7 +558,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             writer.write(resp)
                             await writer.drain()
 
-                        # 🔹 NUEVO: después de REGISTRO (0x0100), pedir GPS (0x8201)
+                        # 1) Después de REGISTRO (0x0100), pedir GPS puntual (0x8201)
                         if msg_id == b"\x01\x00":
                             cmd = build_0x8201(
                                 hdr["phone_bcd"],
@@ -571,11 +571,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             writer.write(cmd)
                             await writer.drain()
 
-                        # (OJO: YA NO arrancamos video aquí; solo GPS por ahora)
-                        # if msg_id == b"\x01\x02":
-                        #     await start_video_if_needed(session, hdr, writer)
-                        # if msg_id == b"\x02\x00" and not session.video_started:
-                        #     ...
+                        # 2) Después de recibir respuesta 0x0201 (GPS puntual), arrancar video
+                        if msg_id == b"\x02\x01":
+                            logger.info(
+                                f"[VIDEO] trigger por 0x0201 phone={hdr['phone_str']}, "
+                                f"enviando 0x9101/0x9102"
+                            )
+                            await start_video_if_needed(session, hdr, writer)
+
+                        # 3) Fallback: si jamás respondió 0x0201 pero ya manda 0x0200,
+                        #    también podemos arrancar video la primera vez.
+                        if msg_id == b"\x02\x00" and not session.video_started:
+                            logger.info(
+                                f"[VIDEO] trigger fallback por 0x0200 phone={hdr['phone_str']}, "
+                                f"enviando 0x9101/0x9102"
+                            )
+                            await start_video_if_needed(session, hdr, writer)
 
                     else:
                         logger.info(
