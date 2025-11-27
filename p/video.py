@@ -345,6 +345,7 @@ def handle_0102_auth(session, hdr, body):
         token = body.decode(errors="ignore") if body else ""
     except Exception:
         token = body.hex()
+        logger.info(f"[0102] Auth phone={hdr['phone_str']} token={token!r}")
     logger.info(f"[0102] Auth phone={hdr['phone_str']} token={token!r}")
     # solo respondemos con 0x8001 OK
     return build_0x8001(
@@ -432,7 +433,7 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
     cmd = [
         FFMPEG_BIN,
         "-loglevel", "warning",
-        "-fflags", "nobuffer",
+        "-fflags", "+genpts+nobuffer",
         "-flags", "low_delay",
         "-thread_queue_size", "4096",
         "-i", fifo_path,
@@ -469,10 +470,12 @@ class SessionState:
         # Datos para H.264 -> FIFO
         self.phone_str = None
         self.pipe_path = None
-        self.h264_started = False       # ya encontré el primer SPS (00 00 01 67)
+        self.h264_started = False       # ya vimos SPS
         self.h264_pipe = None
         self.h264_pipe_failed = False   # si falla escribir, no reintentar en bucle
-        self._tail3 = b""               # últimas 3 bytes para capturar patrones en bordes
+
+        # Buffer para armar NALUs completos
+        self.h264_buf = b""
 
     def next_flow(self) -> bytes:
         return self.flow.next()
@@ -552,50 +555,89 @@ class SessionState:
                 self.h264_pipe = None
         return self.h264_pipe
 
+    # ---------- detección de start-codes y limpieza de NALUs ----------
+
+    def _find_start_code(self, data: bytes, start: int = 0):
+        """
+        Busca un start-code Annex B (00 00 01 o 00 00 00 01) en data[start:].
+        Devuelve (posicion, longitud_del_startcode) o (-1, 0) si no hay.
+        """
+        n = len(data)
+        i = start
+        while i + 3 <= n:
+            # 00 00 01
+            if data[i] == 0 and data[i+1] == 0 and data[i+2] == 1:
+                return i, 3
+            # 00 00 00 01
+            if i + 4 <= n and data[i] == 0 and data[i+1] == 0 and data[i+2] == 0 and data[i+3] == 1:
+                return i, 4
+            i += 1
+        return -1, 0
+
     def feed_h264(self, chunk: bytes):
         """
-        Busca el primer 00 00 01 67 (SPS de H.264) en el stream
-        y a partir de ahí manda todo al FIFO como elementary stream H.264 Annex B.
+        Extrae NALUs H.264 de un stream "sucio" y sólo escribe al FIFO
+        secuencias Annex B válidas:
+            00 00 01 / 00 00 00 01 + [NALU bytes] + ...
+        Hasta que no veamos un SPS (nal_type=7) no empezamos a escribir nada.
 
         IMPORTANTE:
-        - No interpreta JT1078 todavía, solo busca el patrón H.264 en bruto.
-        - Asume que el MDVR está mandando H.264 dentro del stream.
-        - Si aún no tenemos phone_str/pipe_path, no hace nada.
+        - Esto tira a la basura todo lo que NO esté entre start-codes H.264.
         """
         if self.pipe_path is None or self.h264_pipe_failed:
             return
 
-        data = self._tail3 + chunk
+        # Acumular en buffer
+        self.h264_buf += chunk
+        data = self.h264_buf
 
-        try:
-            # Si aún no encontramos el primer SPS, lo buscamos
-            if not self.h264_started:
-                idx = data.find(b"\x00\x00\x01\x67")
-                if idx != -1:
-                    self.h264_started = True
-                    pipe = self.ensure_h264_pipe()
-                    if pipe is not None:
-                        pipe.write(data[idx:])
+        out = bytearray()
+        pos = 0
+
+        while True:
+            sc_pos, sc_len = self._find_start_code(data, pos)
+            if sc_pos == -1:
+                break
+
+            # Buscar siguiente start-code para saber dónde termina este NAL
+            next_pos, _ = self._find_start_code(data, sc_pos + sc_len)
+            if next_pos == -1:
+                # No tenemos aún el siguiente NAL completo, esperamos más datos
+                break
+
+            # Tenemos un NAL completo en data[sc_pos:next_pos]
+            nalu = data[sc_pos:next_pos]
+
+            # El primer byte tras el start-code es el header H.264
+            if sc_pos + sc_len < len(data):
+                nal_header = data[sc_pos + sc_len]
+                nal_type = nal_header & 0x1F
             else:
-                # Ya estamos en modo “H.264 streaming”: mandar chunk tal cual
+                nal_type = -1
+
+            if not self.h264_started:
+                # Sólo arrancamos cuando el primer NAL que vemos es SPS
+                if nal_type == 7:  # SPS
+                    self.h264_started = True
+                    out += nalu
+            else:
+                out += nalu
+
+            pos = next_pos
+
+        # Guardar el "resto" que puede contener un NAL incompleto
+        self.h264_buf = data[pos:]
+
+        if out:
+            try:
                 pipe = self.ensure_h264_pipe()
                 if pipe is not None:
-                    pipe.write(chunk)
-        except BrokenPipeError as e:
-            logger.warning(
-                f"[H264] Error Broken pipe en FIFO {self.pipe_path}: {e}"
-            )
-            self._disable_h264_pipe()
-        except Exception as e:
-            logger.warning(f"[H264] Error escribiendo en FIFO {self.pipe_path}: {e}")
-
-        # Guardar últimas 3 bytes para concatenarlas con el siguiente chunk
-        if len(data) >= 3:
-            self._tail3 = data[-3:]
-        else:
-            self._tail3 = data
-
-    # --- fin manejo FIFOs ---
+                    pipe.write(out)
+            except BrokenPipeError as e:
+                logger.warning(f"[H264] Broken pipe al escribir en {self.pipe_path}: {e}")
+                self._disable_h264_pipe()
+            except Exception as e:
+                logger.warning(f"[H264] Error escribiendo en {self.pipe_path}: {e}")
 
 
 async def start_video_if_needed(session: SessionState, hdr, writer):
@@ -703,12 +745,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     # Checksum: si falla, no spameamos WARNING, solo ignoramos
                     calc = checksum(payload[:-1])
                     if calc != payload[-1]:
-                        # logger.debug("[CHK] Checksum inválido, descartando frame")
                         continue
 
                     hdr = parse_header(payload[:-1])
 
-                    # --- Asignar phone a la sesión directamente desde el header ---
+                    # Asignar phone a la sesión directamente desde el header
                     if session.phone_str is None:
                         session.ensure_phone_and_pipes(hdr["phone_str"])
 
