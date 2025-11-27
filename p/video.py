@@ -2,16 +2,17 @@
 """
 video.py - Servidor TCP "video service" en puerto 7200 que habla JT/T 808 mínimo
 
-Hace SOLO esto:
+Hace esto:
   - Acepta conexiones TCP en 0.0.0.0:7200
   - Parsear frames JT808 (0x7E ... 0x7E)
   - Manejar:
       * Registro (0x0100) -> responde 0x8100 (registro OK)
-      * Auth (0x0102)     -> responde 0x8001 (ACK OK)
+      * Auth (0x0102)     -> responde 0x8001 (ACK OK) y envía 0x9101 + 0x9102
       * Heartbeat (0x0002)-> responde 0x8001 (ACK OK)
       * Posición (0x0200) -> log + 0x8001 (ACK OK)
+  - Envía 0x9101 + 0x9102 por la MISMA conexión/puerto 7200 para pedir video
   - Loguea TODO en hex (logger normal + logger.raw)
-  - NO envía comandos de video ni otros comandos de plataforma.
+  - Guarda TODO el stream crudo (login + video) en archivo por conexión
 """
 
 import asyncio
@@ -25,6 +26,16 @@ HOST = "0.0.0.0"
 PORT = 7200
 
 ALWAYS_ACK_UNKNOWN = True  # responde 0x8001 a mensajes no manejados
+
+# ========== Config de video / AV (JT/T 1078) ==========
+# Le pedimos al terminal que envíe el video a ESTA IP/puerto.
+# Es el mismo host/puerto donde ya está conectando (ajusta la IP si hace falta).
+VIDEO_TARGET_IP = "38.43.134.172"  # tu IP pública
+VIDEO_TCP_PORT = 7200              # mismo puerto 7200
+VIDEO_UDP_PORT = 7200              # si usa UDP, también 7200
+VIDEO_CHANNEL = 1                  # canal lógico
+VIDEO_DATA_TYPE = 1                # 0=audio+video, 1=solo video
+VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -193,6 +204,46 @@ def build_0x8100(
     return build_downlink(b"\x81\x00", phone_bcd, flow_id_platform, body)
 
 
+# ========== Comandos de video JT/T 1078 (0x9101 / 0x9102) ==========
+
+def build_0x9101(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    ip: str,
+    tcp_port: int,
+    udp_port: int,
+    logical_channel: int,
+    data_type: int = 1,   # 0=a+v, 1=solo video
+    frame_type: int = 0,  # 0=main, 1=sub
+):
+    ip_bytes = ip.encode("ascii")
+    body = bytearray()
+    body.append(len(ip_bytes))                # IP length
+    body += ip_bytes                          # IP
+    body += tcp_port.to_bytes(2, "big")       # TCP port
+    body += udp_port.to_bytes(2, "big")       # UDP port
+    body.append(logical_channel & 0xFF)       # logical channel
+    body.append(data_type & 0xFF)             # data type
+    body.append(frame_type & 0xFF)            # frame type
+    return build_downlink(b"\x91\x01", phone_bcd, flow_id_platform, bytes(body))
+
+
+def build_0x9102(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    logical_channel: int,
+    control_cmd: int = 1,   # 0=stop, 1=start/switch
+    close_av_type: int = 0,
+    switch_stream_type: int = 0,
+):
+    body = bytearray()
+    body.append(logical_channel & 0xFF)            # logical channel
+    body.append(control_cmd & 0xFF)                # control cmd
+    body += close_av_type.to_bytes(2, "big")       # close AV type
+    body += switch_stream_type.to_bytes(2, "big")  # stream type
+    return build_downlink(b"\x91\x02", phone_bcd, flow_id_platform, bytes(body))
+
+
 # ========== Handlers uplink mínimos ==========
 def handle_0001_terminal_general_resp(session, hdr, body):
     """
@@ -332,9 +383,54 @@ MSG_HANDLERS = {
 class SessionState:
     def __init__(self):
         self.flow = Flow()
+        self.video_started = False  # para no mandar 9101/9102 más de una vez
 
     def next_flow(self) -> bytes:
         return self.flow.next()
+
+
+async def start_video_if_needed(session: SessionState, hdr, writer):
+    """
+    Envía 0x9101 + 0x9102 por la MISMA conexión/puerto 7200.
+    No abre otro socket, no redirige nada en Python.
+    Solo le dice al terminal que mande su stream a VIDEO_TARGET_IP:7200.
+    """
+    if session.video_started:
+        return
+
+    session.video_started = True
+
+    pkt_9101 = build_0x9101(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        ip=VIDEO_TARGET_IP,
+        tcp_port=VIDEO_TCP_PORT,
+        udp_port=VIDEO_UDP_PORT,
+        logical_channel=VIDEO_CHANNEL,
+        data_type=VIDEO_DATA_TYPE,
+        frame_type=VIDEO_FRAME_TYPE,
+    )
+    logger.info(
+        f"[TX] phone={hdr['phone_str']} msgId=0x9101 "
+        f"(StartAV ch={VIDEO_CHANNEL} -> {VIDEO_TARGET_IP}:{VIDEO_TCP_PORT})"
+    )
+    writer.write(pkt_9101)
+    await writer.drain()
+
+    pkt_9102 = build_0x9102(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        logical_channel=VIDEO_CHANNEL,
+        control_cmd=1,
+        close_av_type=0,
+        switch_stream_type=VIDEO_FRAME_TYPE,
+    )
+    logger.info(
+        f"[TX] phone={hdr['phone_str']} msgId=0x9102 "
+        f"(AVControl START ch={VIDEO_CHANNEL})"
+    )
+    writer.write(pkt_9102)
+    await writer.drain()
 
 
 # ========== Loop por conexión TCP ==========
@@ -352,7 +448,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     session = SessionState()
     buf = b""
 
-    # dump de raw por conexión (opcional)
+    # dump de stream CRUDO por conexión (todo, incluido video)
     dump_filename = f"video808_raw_{peer[0]}_{peer[1]}.bin".replace(":", "_")
     try:
         dump_file = open(dump_filename, "ab")
@@ -365,9 +461,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             chunk = await reader.read(4096)
             if not chunk:
                 break
+
+            # Guardar TODO el stream crudo (login + data + video)
+            if dump_file is not None:
+                try:
+                    dump_file.write(chunk)
+                    dump_file.flush()
+                except Exception as e:
+                    logger.warning(f"[FILE] Error escribiendo en {dump_filename}: {e}")
+
             buf += chunk
 
-            # buscar frames 0x7E ... 0x7E
+            # buscar frames 0x7E ... 0x7E (solo para JT808)
             while True:
                 s = buf.find(START_END)
                 if s == -1:
@@ -409,14 +514,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         f"has_subpkg={hdr['has_subpkg']}"
                     )
 
-                    # Guarda raw en archivo si se pudo abrir
-                    if dump_file is not None:
-                        try:
-                            dump_file.write(payload)
-                            dump_file.flush()
-                        except Exception as e:
-                            logger.warning(f"[FILE] Error escribiendo en {dump_filename}: {e}")
-
                     msg_id = hdr["msg_id"]
                     handler = MSG_HANDLERS.get(msg_id)
 
@@ -430,6 +527,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             )
                             writer.write(resp)
                             await writer.drain()
+
+                        # Después de AUTH (0x0102), pedimos video 1 sola vez
+                        if msg_id == b"\x01\x02":
+                            logger.info(
+                                f"[VIDEO] Auth OK para phone={hdr['phone_str']}, "
+                                f"enviando 0x9101/0x9102 para iniciar stream"
+                            )
+                            await start_video_if_needed(session, hdr, writer)
+
                     else:
                         logger.info(
                             f"[RX] MsgId no manejado: 0x{msg_id.hex()} "
