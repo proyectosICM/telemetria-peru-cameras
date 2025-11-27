@@ -15,7 +15,8 @@ Hace esto:
   - Guarda TODO el stream crudo (login + video) en archivo por conexión
   - Además, extrae el H.264 (Annex B) del stream y lo envía a un FIFO:
         /tmp/<phone>_<canal>.h264
-    para que ffmpeg lo sirva por HTTP (puerto 2000, etc.)
+    y lanza automáticamente un ffmpeg que lo transforma a HLS:
+        /var/www/video/<phone>_<canal>.m3u8
 """
 
 import asyncio
@@ -24,6 +25,7 @@ import logging
 import socket
 import os
 import stat
+import subprocess
 from datetime import datetime
 
 # ========== Config básica ==========
@@ -43,6 +45,14 @@ VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
 
 # Directorio base para los FIFOs de video
 H264_PIPE_DIR = "/tmp"
+
+# Directorio donde se escribirán los .m3u8 y segmentos HLS
+HLS_OUTPUT_DIR = "/var/www/video"
+FFMPEG_BIN = "/usr/bin/ffmpeg"  # ajusta si tu ffmpeg está en otra ruta
+
+# Un ffmpeg por phone+canal
+# key: f"{phone}_{canal}" -> subprocess.Popen
+FFMPEG_PROCS = {}
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -219,7 +229,6 @@ def build_0x8100(
 
 
 # ========== Comandos de video JT/T 1078 (0x9101 / 0x9102) ==========
-
 def build_0x9101(
     phone_bcd: bytes,
     flow_id_platform: bytes,
@@ -393,6 +402,53 @@ MSG_HANDLERS = {
 }
 
 
+# ========== Lanzar ffmpeg -> HLS por teléfono/canal ==========
+def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
+    """
+    Lanza (si no está ya lanzado) un ffmpeg que lee del FIFO /tmp/<phone>_<ch>.h264
+    y genera HLS en /var/www/video/<phone>_<ch>.m3u8
+    """
+    key = f"{phone_str}_{channel}"
+
+    # Si ya tenemos un ffmpeg vivo para este phone/canal, no hacemos nada
+    proc = FFMPEG_PROCS.get(key)
+    if proc is not None and proc.poll() is None:
+        return
+
+    fifo_path = os.path.join(H264_PIPE_DIR, f"{phone_str}_{channel}.h264")
+    m3u8_path = os.path.join(HLS_OUTPUT_DIR, f"{phone_str}_{channel}.m3u8")
+
+    # Asegurarnos de que existe el directorio HLS
+    try:
+        os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"[HLS] No se pudo crear {HLS_OUTPUT_DIR}: {e}")
+        return
+
+    cmd = [
+        FFMPEG_BIN,
+        "-loglevel", "info",
+        "-re",
+        "-i", fifo_path,
+        "-c:v", "copy",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "5",
+        "-hls_flags", "delete_segments",
+        m3u8_path,
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd)
+        FFMPEG_PROCS[key] = proc
+        logger.info(
+            f"[HLS] Lanzado ffmpeg para phone={phone_str} ch={channel}: "
+            f"{' '.join(cmd)}"
+        )
+    except Exception as e:
+        logger.warning(f"[HLS] No se pudo lanzar ffmpeg para {key}: {e}")
+
+
 # ========== Estado de sesión ==========
 class SessionState:
     def __init__(self):
@@ -447,6 +503,9 @@ class SessionState:
             H264_PIPE_DIR, f"{phone_str}_{VIDEO_CHANNEL}.h264"
         )
         logger.info(f"[H264] Canal de video principal: {self.pipe_path}")
+
+        # Lanzar ffmpeg -> HLS para este phone/canal (si no está ya corriendo)
+        start_hls_for_phone(phone_str, VIDEO_CHANNEL)
 
     def _disable_h264_pipe(self):
         self.h264_pipe_failed = True
