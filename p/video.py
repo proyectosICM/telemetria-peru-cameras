@@ -119,6 +119,13 @@ logging.basicConfig(
 logger = logging.getLogger("video808")
 raw_logger = logging.getLogger("video808.raw")
 
+# ========== Cache de phone por IP ==========
+# Idea: en la conexión "de señal" (donde llegan 0x0100 / 0x0102) aprendemos
+# que la IP X corresponde al phone Y (p.ej., 000012345678).
+# Luego, cualquier otra conexión desde esa IP usará ese mismo phone Y
+# para nombrar FIFOs, en lugar de interpretaciones raras de headers basura.
+LAST_PHONE_BY_IP = {}
+
 
 # ========== Header 808 ==========
 def parse_header(payload: bytes):
@@ -406,7 +413,7 @@ class SessionState:
     # --- manejo de FIFOs por dispositivo ---
     def ensure_phone_and_pipes(self, phone_str: str):
         """
-        Se llama cuando ya conocemos el phone_str (del header 808).
+        Se llama cuando ya conocemos el phone_str del terminal.
         Crea los FIFOs /tmp/<phone>_1.h264 ... /tmp/<phone>_8.h264 solo una vez.
         """
         if self.phone_str is not None:
@@ -628,8 +635,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                     hdr = parse_header(payload[:-1])
 
-                    # En cuanto conocemos phone_str, creamos FIFOs (8 canales)
-                    session.ensure_phone_and_pipes(hdr["phone_str"])
+                    # --- Asignar phone a la sesión usando cache por IP ---
+                    peer_ip = None
+                    if isinstance(peer, tuple) and len(peer) >= 1:
+                        peer_ip = peer[0]
+
+                    # Si este mensaje es un REGISTRO o AUTH real, aprendemos el phone para esa IP
+                    if hdr["msg_id"] in (b"\x01\x00", b"\x01\x02") and peer_ip:
+                        LAST_PHONE_BY_IP[peer_ip] = hdr["phone_str"]
+                        logger.info(
+                            f"[PHONE] Aprendido phone={hdr['phone_str']} para IP={peer_ip}"
+                        )
+
+                    # Si la sesión aún no tiene phone, pero ya tenemos uno cacheado para la IP,
+                    # inicializamos los FIFOs con ese phone (p.ej. 000012345678)
+                    if session.phone_str is None and peer_ip and peer_ip in LAST_PHONE_BY_IP:
+                        session.ensure_phone_and_pipes(LAST_PHONE_BY_IP[peer_ip])
 
                     body = payload[:-1][
                         hdr["body_idx"]: hdr["body_idx"] + hdr["body_len"]
