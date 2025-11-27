@@ -13,6 +13,9 @@ Hace esto:
   - Envía 0x9101 + 0x9102 por la MISMA conexión/puerto 7200 para pedir video
   - Loguea TODO en hex (logger normal + logger.raw)
   - Guarda TODO el stream crudo (login + video) en archivo por conexión
+  - Además, extrae el H.264 (Annex B) del stream y lo envía a un FIFO:
+        /tmp/000012345678_1.h264
+    para que ffmpeg lo sirva por HTTP (puerto 2000, etc.)
 """
 
 import asyncio
@@ -36,6 +39,12 @@ VIDEO_UDP_PORT = 7200              # si usa UDP, también 7200
 VIDEO_CHANNEL = 1                  # canal lógico
 VIDEO_DATA_TYPE = 1                # 0=audio+video, 1=solo video
 VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
+
+# ========== FIFO H.264 para ffmpeg ==========
+# Por ahora hardcodeado a un solo dispositivo/canal: 000012345678_1
+# Debes crear el FIFO antes de ejecutar el script:
+#   mkfifo /tmp/000012345678_1.h264
+H264_PIPE_PATH = "/tmp/000012345678_1.h264"
 
 # ========== Framing / escape JT808 ==========
 START_END = b"\x7e"
@@ -385,8 +394,68 @@ class SessionState:
         self.flow = Flow()
         self.video_started = False  # para no mandar 9101/9102 más de una vez
 
+        # Para extraer H.264 y mandarlo al FIFO
+        self.h264_started = False       # ya encontré el primer SPS (00 00 01 67)
+        self.h264_pipe = None
+        self.h264_pipe_failed = False   # si falla abrir el FIFO, no reintentar en bucle
+        self._tail3 = b""               # últimas 3 bytes para capturar patrones en bordes
+
     def next_flow(self) -> bytes:
         return self.flow.next()
+
+    def ensure_h264_pipe(self):
+        """
+        Abre el FIFO H.264 si aún no está abierto.
+        """
+        if self.h264_pipe is None and not self.h264_pipe_failed:
+            try:
+                self.h264_pipe = open(H264_PIPE_PATH, "wb", buffering=0)
+                logger.info(f"[H264] FIFO abierto para escritura: {H264_PIPE_PATH}")
+            except Exception as e:
+                logger.warning(f"[H264] No se pudo abrir FIFO {H264_PIPE_PATH}: {e}")
+                self.h264_pipe_failed = True
+        return self.h264_pipe
+
+    def feed_h264(self, chunk: bytes):
+        """
+        Busca el primer 00 00 01 67 (SPS de H.264) en el stream
+        y a partir de ahí manda todo al FIFO como elementary stream H.264 Annex B.
+
+        IMPORTANTE:
+        - No interpreta JT1078 todavía, solo busca el patrón H.264 en bruto.
+        - Asume que el MDVR está mandando H.264 dentro del stream.
+        """
+        data = self._tail3 + chunk
+
+        # Si aún no encontramos el primer SPS, lo buscamos
+        if not self.h264_started:
+            idx = data.find(b"\x00\x00\x01\x67")
+            if idx != -1:
+                self.h264_started = True
+                pipe = self.ensure_h264_pipe()
+                if pipe is not None:
+                    try:
+                        pipe.write(data[idx:])
+                    except Exception as e:
+                        logger.warning(f"[H264] Error escribiendo en FIFO: {e}")
+                else:
+                    logger.warning("[H264] FIFO no disponible, no se escribe H.264")
+        else:
+            # Ya estamos en modo “H.264 streaming”: mandar chunk tal cual
+            pipe = self.ensure_h264_pipe()
+            if pipe is not None:
+                try:
+                    pipe.write(chunk)
+                except Exception as e:
+                    logger.warning(f"[H264] Error escribiendo en FIFO: {e}")
+            else:
+                logger.warning("[H264] FIFO no disponible, no se escribe H.264")
+
+        # Guardar últimas 3 bytes para concatenarlas con el siguiente chunk
+        if len(data) >= 3:
+            self._tail3 = data[-3:]
+        else:
+            self._tail3 = data
 
 
 async def start_video_if_needed(session: SessionState, hdr, writer):
@@ -469,6 +538,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     dump_file.flush()
                 except Exception as e:
                     logger.warning(f"[FILE] Error escribiendo en {dump_filename}: {e}")
+
+            # Alimentar el extractor de H.264 para el FIFO (ffmpeg)
+            try:
+                session.feed_h264(chunk)
+            except Exception as e:
+                logger.warning(f"[H264] Error en feed_h264: {e}")
 
             buf += chunk
 
@@ -567,6 +642,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 dump_file.close()
         except Exception:
             pass
+
+        try:
+            if session.h264_pipe is not None:
+                session.h264_pipe.close()
+        except Exception:
+            pass
+
         try:
             writer.close()
             await writer.wait_closed()
