@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-video.py - Servidor JT808 mínimo + socket separado solo para video
+video.py - Servidor JT808 mínimo + socket separado solo para video (JT/T 1078)
 
 Hace esto:
 
@@ -15,10 +15,11 @@ Hace esto:
     * Guarda el "phone" real globalmente
 
 - Puerto 7201 (VIDEO):
-    * Acepta conexiones TCP solo de video
+    * Acepta conexiones TCP solo de video (stream JT/T 1078)
     * NO parsea JT808
-    * Cualquier chunk que llega se manda a SessionState.feed_h264()
-      usando el phone conocido para crear FIFO y lanzar ffmpeg.
+    * Parseamos paquetes JT1078 (cabecera 0x30 0x31 0x63 0x64 + header)
+      y de cada paquete sacamos SOLO el cuerpo H.264 y se lo damos a
+      SessionState.feed_h264().
 
 - FIFO H264:       /tmp/<phone>_1.h264
 - HLS de salida:   /var/www/video/<phone>_1.m3u8
@@ -73,6 +74,11 @@ ESC = b"\x7d"
 ESC_MAP = {b"\x02": b"\x7e", b"\x01": b"\x7d"}
 REVERSE_ESC_MAP = {b"\x7e": b"\x7d\x02", b"\x7d": b"\x7d\x01"}
 
+# ========== Cabecera JT/T 1078 stream (Tabla 19) ==========
+
+JT1078_MAGIC = b"\x30\x31\x63\x64"   # 0x30 0x31 0x63 0x64
+JT1078_HEADER_MIN = 30               # bytes hasta message body (header completo)
+
 
 def de_escape(payload: bytes) -> bytes:
     out, i = bytearray(), 0
@@ -94,7 +100,7 @@ def do_escape(raw: bytes) -> bytes:
             out += REVERSE_ESC_MAP[bb]
         else:
             out += bb
-    return bytes(out)
+    return out
 
 
 def checksum(data: bytes) -> int:
@@ -471,6 +477,9 @@ class SessionState:
         self.h264_pipe_failed = False
         self.h264_buf = b""
 
+        # Buffer de paquetes JT/T 1078 en el socket de video
+        self.jt1078_buf = b""
+
         # Tracking de SPS / PPS / IDR
         self.sps_seen = False
         self.pps_seen = False
@@ -541,6 +550,68 @@ class SessionState:
                 self.h264_pipe_failed = True
                 self.h264_pipe = None
         return self.h264_pipe
+
+    # ---------- parser de paquetes JT/T 1078 en el socket de VIDEO ----------
+
+    def feed_jt1078(self, chunk: bytes):
+        """
+        Acumula datos del socket de video (puerto 7201), extrae paquetes JT/T 1078
+        (Tabla 19: magic 0x30316364, cabecera ~30 bytes) y de cada paquete
+        entrega SOLO el cuerpo H.264 a feed_h264().
+        """
+        if self.h264_pipe_failed and not self.h264_started:
+            # si ya sabemos que el pipe está muerto y ni siquiera arrancó, no pierdas tiempo
+            return
+
+        self.jt1078_buf += chunk
+
+        while True:
+            buf = self.jt1078_buf
+
+            # Necesitamos al menos la magic
+            if len(buf) < 4:
+                return
+
+            if buf[0:4] != JT1078_MAGIC:
+                # Buscar la próxima aparición de magic
+                idx = buf.find(JT1078_MAGIC, 1)
+                if idx == -1:
+                    # conserva solo los últimos 3 bytes por si la magic cae cortada ahí
+                    self.jt1078_buf = buf[-3:]
+                    return
+                # descarta basura previa
+                self.jt1078_buf = buf[idx:]
+                buf = self.jt1078_buf
+
+            # Header mínimo
+            if len(buf) < JT1078_HEADER_MIN:
+                return
+
+            # data_type (alto nibble) + subpackage (bajo nibble)
+            data_type_and_sub = buf[15]
+            data_type = (data_type_and_sub & 0xF0) >> 4      # 0=I,1=P,2=B,3=audio,4=data...
+            sub_flag = data_type_and_sub & 0x0F              # 0=sin subpaquete, 1=first,2=last,3=middle
+
+            # Longitud del cuerpo (message body length) en offset 28-29
+            body_len = int.from_bytes(buf[28:30], "big", signed=False)
+            total_len = JT1078_HEADER_MIN + body_len
+
+            if len(buf) < total_len:
+                # paquete incompleto todavía
+                return
+
+            body = buf[30:total_len]
+
+            # Avanzar buffer
+            self.jt1078_buf = buf[total_len:]
+
+            # Solo nos interesan frames de video (I/P/B)
+            if data_type in (0, 1, 2):
+                # Aunque haya subpaquetes, concatenar en el stream es seguro
+                self.feed_h264(body)
+            else:
+                # audio u otros -> por ahora ignoramos
+                continue
 
     # ---------- detección de start-codes y limpieza de NALUs ----------
 
@@ -860,8 +931,9 @@ async def handle_video_stream(reader: asyncio.StreamReader,
             if not session.phone_str and CURRENT_PHONE:
                 session.ensure_phone_and_pipes(CURRENT_PHONE)
 
-            # Mandamos TODOS los bytes al extractor H264.
-            session.feed_h264(chunk)
+            # Mandamos todos los bytes al parser JT/T 1078,
+            # que a su vez llama a feed_h264() con solo el cuerpo H.264.
+            session.feed_jt1078(chunk)
 
     except Exception as e:
         logger.exception(f"[VID] Error en conexión de video {peer}: {e}")
