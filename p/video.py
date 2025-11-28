@@ -550,9 +550,17 @@ class SessionState:
         return -1, 0
 
     def feed_h264(self, chunk: bytes):
+        """
+        Extrae NALUs H.264 válidos y los escribe en el FIFO:
+
+        - Espera a ver un SPS (nal_type == 7) para empezar.
+        - Luego solo deja pasar nal_type en rango 1..23 (NALs válidos H.264).
+        - Descarta NALs raros (0, 24–31) que podrían ser basura / headers raros.
+        """
         if self.pipe_path is None or self.h264_pipe_failed:
             return
 
+        # Acumula en buffer
         self.h264_buf += chunk
         data = self.h264_buf
 
@@ -566,10 +574,12 @@ class SessionState:
 
             next_pos, _ = self._find_start_code(data, sc_pos + sc_len)
             if next_pos == -1:
+                # No tenemos aún el siguiente NAL completo
                 break
 
             nalu = data[sc_pos:next_pos]
 
+            # nal header inmediatamente después del start-code
             if sc_pos + sc_len < len(data):
                 nal_header = data[sc_pos + sc_len]
                 nal_type = nal_header & 0x1F
@@ -577,14 +587,21 @@ class SessionState:
                 nal_type = -1
 
             if not self.h264_started:
+                # Solo arrancamos cuando el primer NAL útil es SPS
                 if nal_type == 7:  # SPS
                     self.h264_started = True
                     out += nalu
             else:
-                out += nalu
+                # Solo aceptamos NALU con tipo válido (1..23)
+                if 1 <= nal_type <= 23:
+                    out += nalu
+                else:
+                    # NAL extraño (0, 24–31), se descarta silenciosamente
+                    pass
 
             pos = next_pos
 
+        # Guardar resto (NAL incompleto)
         self.h264_buf = data[pos:]
 
         if out:
