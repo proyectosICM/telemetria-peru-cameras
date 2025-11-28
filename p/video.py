@@ -15,14 +15,14 @@ Hace esto:
     * Guarda el "phone" real globalmente
 
 - Puerto 7201 (VIDEO):
-    * Acepta conexiones TCP solo de video (stream JT/T 1078)
+    * Acepta conexiones TCP solo para video (stream JT/T 1078)
     * NO parsea JT808
     * Parseamos paquetes JT1078 (cabecera 0x30 0x31 0x63 0x64 + header)
-      y de cada paquete sacamos SOLO el cuerpo H.264 y se lo damos a
-      SessionState.feed_h264().
+      y de cada paquete sacamos SOLO el cuerpo H.264 y lo mandamos al
+      estado del canal correspondiente (por logical_channel).
 
-- FIFO H264:       /tmp/<phone>_1.h264
-- HLS de salida:   /var/www/video/<phone>_1.m3u8
+- FIFOs H264:       /tmp/<phone>_<canal>.h264   (canal 1..8)
+- HLS de salida:    /var/www/video/<phone>_<canal>.m3u8
 """
 
 import asyncio
@@ -53,9 +53,9 @@ CURRENT_PHONE = None  # se setea cuando llega un 0100/0102/0200 con phone razona
 # ========== Config de video / AV (JT/T 1078) ==========
 
 VIDEO_TARGET_IP = "38.43.134.172"  # tu IP pública
-VIDEO_CHANNEL = 1                  # canal lógico
 VIDEO_DATA_TYPE = 1                # 0=a+v, 1=solo video
 VIDEO_FRAME_TYPE = 0               # 0=main, 1=sub
+MAX_CHANNELS = 8                   # canales lógicos 1..8
 
 # Directorio base para los FIFOs de video
 H264_PIPE_DIR = "/tmp"
@@ -74,10 +74,13 @@ ESC = b"\x7d"
 ESC_MAP = {b"\x02": b"\x7e", b"\x01": b"\x7d"}
 REVERSE_ESC_MAP = {b"\x7e": b"\x7d\x02", b"\x7d": b"\x7d\x01"}
 
-# ========== Cabecera JT/T 1078 stream (Tabla 19) ==========
+# ========== Cabecera JT/T 1078 stream (Tabla 19 simplificada) ==========
 
 JT1078_MAGIC = b"\x30\x31\x63\x64"   # 0x30 0x31 0x63 0x64
 JT1078_HEADER_MIN = 30               # bytes hasta message body (header completo)
+JT1078_LOGICAL_CHANNEL_OFFSET = 14   # byte 14 = logical_channel (según capturas)
+JT1078_DATA_TYPE_OFFSET = 15         # byte 15 = dataType(4 bits altos) + subFlag(4 bajos)
+JT1078_BODY_LEN_OFFSET = 28          # 2 bytes big-endian
 
 
 def de_escape(payload: bytes) -> bytes:
@@ -100,7 +103,6 @@ def do_escape(raw: bytes) -> bytes:
             out += REVERSE_ESC_MAP[bb]
         else:
             out += bb
-    # IMPORTANTE: devolver bytes, no bytearray
     return bytes(out)
 
 
@@ -313,7 +315,6 @@ def handle_0002_heartbeat(session, hdr, body):
 
 def _update_current_phone(hdr):
     global CURRENT_PHONE
-    # Si el teléfono parece medianamente razonable (solo dígitos y tamaño decente)
     if hdr["phone_str"].isdigit() and len(hdr["phone_str"]) >= 6:
         CURRENT_PHONE = hdr["phone_str"]
         logger.info(f"[GLOBAL] CURRENT_PHONE actualizado a {CURRENT_PHONE}")
@@ -418,7 +419,7 @@ MSG_HANDLERS = {
 
 # ========== Lanzar ffmpeg -> HLS por teléfono/canal ==========
 
-def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
+def start_hls_for_phone(phone_str: str, channel: int):
     key = f"{phone_str}_{channel}"
 
     proc = FFMPEG_PROCS.get(key)
@@ -434,24 +435,17 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
         logger.warning(f"[HLS] No se pudo crear {HLS_OUTPUT_DIR}: {e}")
         return
 
-    # ⚠️ AQUÍ VA EL CMD CORREGIDO
     cmd = [
         FFMPEG_BIN,
         "-loglevel", "warning",
-        # Generar PTS nuevos cuando falten/estén locos
         "-fflags", "+genpts",
-        # Cola de entrada grande para el FIFO
         "-thread_queue_size", "4096",
-        # Asumimos que el H.264 viene ~25fps
         "-framerate", "25",
         "-i", fifo_path,
-        # Solo video, sin audio
         "-an",
-        # Reencodear para tener timing limpio y compatible
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
-        # Forzamos salida CFR a 25 fps
         "-r", "25",
         "-f", "hls",
         "-hls_time", "2",
@@ -471,7 +465,203 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
         logger.warning(f"[HLS] No se pudo lanzar ffmpeg para {key}: {e}")
 
 
-# ========== Estado de sesión (compartido) ==========
+# ========== Estado de canal (H.264 por canal lógico) ==========
+
+class ChannelState:
+    def __init__(self, phone_str: str, channel: int):
+        self.phone_str = phone_str
+        self.channel = channel
+        self.pipe_path = os.path.join(
+            H264_PIPE_DIR, f"{phone_str}_{channel}.h264"
+        )
+
+        self.h264_pipe = None
+        self.h264_pipe_failed = False
+
+        # Estado H.264
+        self.h264_buf = b""
+        self.sps_seen = False
+        self.pps_seen = False
+        self.idr_started = False
+        self.last_sps = None
+        self.last_pps = None
+        self.h264_started = False
+        self.first_write_logged = False
+
+    def _disable_h264_pipe(self):
+        self.h264_pipe_failed = True
+        if self.h264_pipe is not None:
+            try:
+                self.h264_pipe.close()
+            except Exception:
+                pass
+        self.h264_pipe = None
+        logger.warning(
+            f"[H264] FIFO deshabilitado para phone={self.phone_str} "
+            f"ch={self.channel} (Broken pipe)"
+        )
+
+    def ensure_fifo_exists(self):
+        """
+        Asegura que la FIFO exista (por si falló la creación global).
+        """
+        try:
+            st = os.stat(self.pipe_path)
+            if not stat.S_ISFIFO(st.st_mode):
+                logger.warning(
+                    f"[H264] {self.pipe_path} existe y no es FIFO, se deja tal cual"
+                )
+        except FileNotFoundError:
+            try:
+                os.mkfifo(self.pipe_path, 0o666)
+                logger.info(f"[H264] FIFO creada on-demand: {self.pipe_path}")
+            except FileExistsError:
+                logger.info(f"[H264] FIFO ya existía (race): {self.pipe_path}")
+            except Exception as e:
+                logger.warning(f"[H264] No se pudo crear FIFO {self.pipe_path}: {e}")
+
+    def ensure_h264_pipe(self):
+        if self.h264_pipe_failed:
+            return None
+
+        if self.h264_pipe is None:
+            self.ensure_fifo_exists()
+            try:
+                self.h264_pipe = open(self.pipe_path, "wb", buffering=0)
+                logger.info(
+                    f"[H264] FIFO abierto para escritura: {self.pipe_path}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[H264] No se pudo abrir FIFO {self.pipe_path}: {e}"
+                )
+                self.h264_pipe_failed = True
+                self.h264_pipe = None
+        return self.h264_pipe
+
+    def _find_start_code(self, data: bytes, start: int = 0):
+        n = len(data)
+        i = start
+        while i + 3 <= n:
+            if data[i] == 0 and data[i+1] == 0 and data[i+2] == 1:
+                return i, 3
+            if (
+                i + 4 <= n and
+                data[i] == 0 and data[i+1] == 0 and data[i+2] == 0 and data[i+3] == 1
+            ):
+                return i, 4
+            i += 1
+        return -1, 0
+
+    def feed_h264(self, chunk: bytes):
+        """
+        Extrae NALUs H.264 válidos y los escribe en el FIFO del canal:
+
+        - Espera a ver SPS (7) y PPS (8).
+        - Luego espera un IDR (5).
+        - Recién ahí arranca el stream bueno escribiendo:
+            SPS + PPS + IDR
+        - A partir de entonces sólo deja pasar nal_type en 1..23.
+        """
+        if self.h264_pipe_failed:
+            return
+
+        self.h264_buf += chunk
+        data = self.h264_buf
+
+        out = bytearray()
+        pos = 0
+
+        while True:
+            sc_pos, sc_len = self._find_start_code(data, pos)
+            if sc_pos == -1:
+                break
+
+            next_pos, _ = self._find_start_code(data, sc_pos + sc_len)
+            if next_pos == -1:
+                break
+
+            nalu = data[sc_pos:next_pos]
+
+            if sc_pos + sc_len < len(data):
+                nal_header = data[sc_pos + sc_len]
+                nal_type = nal_header & 0x1F
+            else:
+                nal_type = -1
+
+            if not self.idr_started:
+                if nal_type == 7:  # SPS
+                    if not self.sps_seen:
+                        logger.info(
+                            f"[H264] SPS detectado phone={self.phone_str} "
+                            f"ch={self.channel} (nal_type=7)"
+                        )
+                    self.sps_seen = True
+                    self.last_sps = nalu
+                elif nal_type == 8:  # PPS
+                    if not self.pps_seen:
+                        logger.info(
+                            f"[H264] PPS detectado phone={self.phone_str} "
+                            f"ch={self.channel} (nal_type=8)"
+                        )
+                    self.pps_seen = True
+                    self.last_pps = nalu
+                elif nal_type == 5:  # IDR
+                    logger.info(
+                        f"[H264] IDR detectado phone={self.phone_str} "
+                        f"ch={self.channel} (nal_type=5), "
+                        f"sps_seen={self.sps_seen} pps_seen={self.pps_seen}"
+                    )
+                    if self.sps_seen and self.pps_seen:
+                        self.idr_started = True
+                        self.h264_started = True
+                        logger.info(
+                            f"[H264] Arrancando stream bueno para "
+                            f"phone={self.phone_str} ch={self.channel} "
+                            f"(SPS+PPS+IDR)"
+                        )
+                        # Lanza ffmpeg para este canal
+                        start_hls_for_phone(self.phone_str, self.channel)
+                        # Encolamos SPS + PPS + este IDR
+                        if self.last_sps:
+                            out += self.last_sps
+                        if self.last_pps:
+                            out += self.last_pps
+                        out += nalu
+            else:
+                if 1 <= nal_type <= 23:
+                    out += nalu
+
+            pos = next_pos
+
+        self.h264_buf = data[pos:]
+
+        if out:
+            try:
+                pipe = self.ensure_h264_pipe()
+                if pipe is not None:
+                    pipe.write(out)
+                    if self.h264_started and not self.first_write_logged:
+                        self.first_write_logged = True
+                        logger.info(
+                            f"[H264] Stream de video iniciado para "
+                            f"phone={self.phone_str} ch={self.channel} "
+                            f"FIFO={self.pipe_path}"
+                        )
+            except BrokenPipeError as e:
+                logger.error(
+                    f"[H264] Broken pipe al escribir en FIFO "
+                    f"phone={self.phone_str} ch={self.channel}: {e}"
+                )
+                self._disable_h264_pipe()
+            except Exception as e:
+                logger.error(
+                    f"[H264] Error escribiendo en FIFO "
+                    f"phone={self.phone_str} ch={self.channel}: {e}"
+                )
+
+
+# ========== Estado de sesión (por conexión) ==========
 
 class SessionState:
     def __init__(self):
@@ -479,23 +669,12 @@ class SessionState:
         self.video_started = False
 
         self.phone_str = None
-        self.pipe_path = None
-
-        # Estado H.264
-        self.h264_started = False          # stream "bueno" ya arrancó
-        self.h264_pipe = None
-        self.h264_pipe_failed = False
-        self.h264_buf = b""
 
         # Buffer de paquetes JT/T 1078 en el socket de video
         self.jt1078_buf = b""
 
-        # Tracking de SPS / PPS / IDR
-        self.sps_seen = False
-        self.pps_seen = False
-        self.idr_started = False
-        self.last_sps = None
-        self.last_pps = None
+        # Canales lógicos activos: ch -> ChannelState
+        self.channels = {}
 
         # Flags de debug
         self.first_video_chunk_logged = False
@@ -504,8 +683,6 @@ class SessionState:
     def next_flow(self) -> bytes:
         return self.flow.next()
 
-    # --- manejo de FIFOs por dispositivo ---
-
     def ensure_phone_and_pipes(self, phone_str: str):
         if self.phone_str is not None:
             return
@@ -513,7 +690,7 @@ class SessionState:
         self.phone_str = phone_str
         logger.info(f"[H264] Inicializando FIFOs para phone={phone_str}")
 
-        for ch in range(1, 9):
+        for ch in range(1, MAX_CHANNELS + 1):
             path = os.path.join(H264_PIPE_DIR, f"{phone_str}_{ch}.h264")
             try:
                 st = os.stat(path)
@@ -532,52 +709,40 @@ class SessionState:
                 except Exception as e:
                     logger.warning(f"[H264] No se pudo crear FIFO {path}: {e}")
 
-        self.pipe_path = os.path.join(
-            H264_PIPE_DIR, f"{phone_str}_{VIDEO_CHANNEL}.h264"
+        logger.info(
+            f"[H264] FIFOs preparados para phone={phone_str} canales 1..{MAX_CHANNELS}"
         )
-        logger.info(f"[H264] Canal de video principal: {self.pipe_path}")
 
-        start_hls_for_phone(phone_str, VIDEO_CHANNEL)
-
-    def _disable_h264_pipe(self):
-        self.h264_pipe_failed = True
-        if self.h264_pipe is not None:
-            try:
-                self.h264_pipe.close()
-            except Exception:
-                pass
-        self.h264_pipe = None
-        logger.warning("[H264] FIFO deshabilitado para esta sesión (Broken pipe)")
-
-    def ensure_h264_pipe(self):
-        if self.h264_pipe_failed:
+    def get_channel_state(self, logical_channel: int) -> ChannelState | None:
+        if not self.phone_str:
             return None
-        if self.pipe_path is None:
+        if not (1 <= logical_channel <= MAX_CHANNELS):
             return None
+        st = self.channels.get(logical_channel)
+        if st is None:
+            st = ChannelState(self.phone_str, logical_channel)
+            self.channels[logical_channel] = st
+        return st
 
-        if self.h264_pipe is None:
-            try:
-                self.h264_pipe = open(self.pipe_path, "wb", buffering=0)
-                logger.info(f"[H264] FIFO abierto para escritura: {self.pipe_path}")
-            except Exception as e:
-                logger.warning(f"[H264] No se pudo abrir FIFO {self.pipe_path}: {e}")
-                self.h264_pipe_failed = True
-                self.h264_pipe = None
-        return self.h264_pipe
+    def close_all_pipes(self):
+        for ch, st in self.channels.items():
+            if st.h264_pipe is not None:
+                try:
+                    st.h264_pipe.close()
+                except Exception:
+                    pass
 
     # ---------- parser de paquetes JT/T 1078 en el socket de VIDEO ----------
 
     def feed_jt1078(self, chunk: bytes):
         """
         Acumula datos del socket de video (puerto 7201), extrae paquetes JT/T 1078
-        (Tabla 19: magic 0x30316364, cabecera ~30 bytes) y de cada paquete
-        entrega SOLO el cuerpo H.264 a feed_h264().
+        y enruta el cuerpo H.264 al ChannelState correspondiente.
         """
-        if self.h264_pipe_failed and not self.h264_started:
-            # si ya sabemos que el pipe está muerto y ni siquiera arrancó, no pierdas tiempo
+        if not self.phone_str:
+            # Hasta que no sepamos el phone desde CONTROL, descartamos
             return
 
-        # Loguear solo el primer chunk que entra por 7201, para ver qué formato trae
         if not self.first_video_chunk_logged:
             self.first_video_chunk_logged = True
             logger.info(
@@ -590,15 +755,12 @@ class SessionState:
         while True:
             buf = self.jt1078_buf
 
-            # Necesitamos al menos la magic
             if len(buf) < 4:
                 return
 
             if buf[0:4] != JT1078_MAGIC:
-                # No empieza por magic, intentar resync
                 idx = buf.find(JT1078_MAGIC, 1)
                 if idx == -1:
-                    # conserva solo los últimos 3 bytes por si la magic cae cortada ahí
                     logger.warning(
                         f"[JT1078] No se encontró magic en {len(buf)} bytes, "
                         f"descartando todo menos últimos 3."
@@ -612,204 +774,92 @@ class SessionState:
                     self.jt1078_buf = buf[idx:]
                     buf = self.jt1078_buf
 
-            # Header mínimo
             if len(buf) < JT1078_HEADER_MIN:
                 return
 
-            # data_type (alto nibble) + subpackage (bajo nibble) en offset 15
-            data_type_and_sub = buf[15]
-            data_type = (data_type_and_sub & 0xF0) >> 4      # 0=I,1=P,2=B,3=audio,4=data...
-            sub_flag = data_type_and_sub & 0x0F              # 0=sin subpaquete, 1=first,2=last,3=middle
+            logical_channel = buf[JT1078_LOGICAL_CHANNEL_OFFSET]
+            data_type_and_sub = buf[JT1078_DATA_TYPE_OFFSET]
+            data_type = (data_type_and_sub & 0xF0) >> 4
+            sub_flag = data_type_and_sub & 0x0F
 
-            # Longitud del cuerpo (message body length) en offset 28-29
-            body_len = int.from_bytes(buf[28:30], "big", signed=False)
+            body_len = int.from_bytes(
+                buf[JT1078_BODY_LEN_OFFSET:JT1078_BODY_LEN_OFFSET+2],
+                "big",
+                signed=False,
+            )
             total_len = JT1078_HEADER_MIN + body_len
 
             if len(buf) < total_len:
-                # paquete incompleto todavía
                 return
 
             body = buf[30:total_len]
 
-            # Avanzar buffer
             self.jt1078_buf = buf[total_len:]
             self.jt1078_packet_count += 1
 
             if self.jt1078_packet_count <= 5:
                 logger.info(
                     f"[JT1078] pkt#{self.jt1078_packet_count} "
-                    f"data_type={data_type} sub_flag={sub_flag} "
-                    f"body_len={body_len}"
+                    f"ch={logical_channel} data_type={data_type} "
+                    f"sub_flag={sub_flag} body_len={body_len}"
                 )
 
-            # Solo nos interesan frames de video (I/P/B)
             if data_type in (0, 1, 2):
-                # Aunque haya subpaquetes, concatenar en el stream es seguro
-                self.feed_h264(body)
+                ch_state = self.get_channel_state(logical_channel)
+                if ch_state is not None:
+                    ch_state.feed_h264(body)
             else:
-                # audio u otros -> por ahora ignoramos
                 if self.jt1078_packet_count <= 5:
                     logger.info(
                         f"[JT1078] pkt#{self.jt1078_packet_count} tipo no-video "
-                        f"(data_type={data_type}), ignorado."
+                        f"(ch={logical_channel} data_type={data_type}), ignorado."
                     )
                 continue
 
-    # ---------- detección de start-codes y limpieza de NALUs ----------
-
-    def _find_start_code(self, data: bytes, start: int = 0):
-        n = len(data)
-        i = start
-        while i + 3 <= n:
-            if data[i] == 0 and data[i+1] == 0 and data[i+2] == 1:
-                return i, 3
-            if (
-                i + 4 <= n and
-                data[i] == 0 and data[i+1] == 0 and data[i+2] == 0 and data[i+3] == 1
-            ):
-                return i, 4
-            i += 1
-        return -1, 0
-
-    def feed_h264(self, chunk: bytes):
-        """
-        Extrae NALUs H.264 válidos y los escribe en el FIFO:
-
-        - Espera a ver SPS (7) y PPS (8).
-        - Luego espera un IDR (5).
-        - Recién ahí arranca el stream "bueno" escribiendo:
-            SPS + PPS + IDR
-        - A partir de entonces sólo deja pasar nal_type en 1..23.
-        """
-        if self.pipe_path is None or self.h264_pipe_failed:
-            return
-
-        # Acumula en buffer
-        self.h264_buf += chunk
-        data = self.h264_buf
-
-        out = bytearray()
-        pos = 0
-
-        while True:
-            sc_pos, sc_len = self._find_start_code(data, pos)
-            if sc_pos == -1:
-                break
-
-            next_pos, _ = self._find_start_code(data, sc_pos + sc_len)
-            if next_pos == -1:
-                # No tenemos aún el siguiente NAL completo
-                break
-
-            nalu = data[sc_pos:next_pos]
-
-            # nal header inmediatamente después del start-code
-            if sc_pos + sc_len < len(data):
-                nal_header = data[sc_pos + sc_len]
-                nal_type = nal_header & 0x1F
-            else:
-                nal_type = -1
-
-            if not self.idr_started:
-                # Antes de arrancar, coleccionamos SPS/PPS y esperamos IDR
-                if nal_type == 7:  # SPS
-                    if not self.sps_seen:
-                        logger.info("[H264] SPS detectado (nal_type=7)")
-                    self.sps_seen = True
-                    self.last_sps = nalu
-                elif nal_type == 8:  # PPS
-                    if not self.pps_seen:
-                        logger.info("[H264] PPS detectado (nal_type=8)")
-                    self.pps_seen = True
-                    self.last_pps = nalu
-                elif nal_type == 5:  # IDR
-                    logger.info(
-                        f"[H264] IDR detectado (nal_type=5), "
-                        f"sps_seen={self.sps_seen} pps_seen={self.pps_seen}"
-                    )
-                    # Sólo arrancamos si ya tenemos SPS+PPS
-                    if self.sps_seen and self.pps_seen:
-                        self.idr_started = True
-                        self.h264_started = True
-                        logger.info("[H264] Arrancando stream bueno (SPS+PPS+IDR)")
-                        # Metemos SPS + PPS + este IDR al output
-                        if self.last_sps:
-                            out += self.last_sps
-                        if self.last_pps:
-                            out += self.last_pps
-                        out += nalu
-                # Cualquier otra cosa antes del primer IDR limpio se tira
-            else:
-                # Stream ya arrancado: sólo tipos válidos 1..23
-                if 1 <= nal_type <= 23:
-                    out += nalu
-                else:
-                    # NAL raro (0, 24–31), lo ignoramos
-                    pass
-
-            pos = next_pos
-
-        # Guardar resto (NAL incompleto)
-        self.h264_buf = data[pos:]
-
-        if out:
-            try:
-                pipe = self.ensure_h264_pipe()
-                if pipe is not None:
-                    pipe.write(out)
-                    # Para debug, loguear solo cuando recién empezamos a escribir
-                    if self.h264_started:
-                        logger.info(
-                            f"[H264] Escribiendo {len(out)} bytes al FIFO {self.pipe_path}"
-                        )
-            except BrokenPipeError as e:
-                logger.warning(
-                    f"[H264] Broken pipe al escribir en {self.pipe_path}: {e}"
-                )
-                self._disable_h264_pipe()
-            except Exception as e:
-                logger.warning(
-                    f"[H264] Error escribiendo en {self.pipe_path}: {e}"
-                )
-
 
 async def start_video_if_needed(session: SessionState, hdr, writer):
+    """
+    Tras la auth, pedimos video para TODOS los canales 1..MAX_CHANNELS.
+    Si un canal no tiene cámara, simplemente el DVR lo ignorará.
+    """
     if session.video_started:
         return
 
     session.video_started = True
+    phone_str = hdr["phone_str"]
 
-    pkt_9101 = build_0x9101(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        ip=VIDEO_TARGET_IP,
-        tcp_port=VIDEO_TCP_PORT,
-        udp_port=VIDEO_UDP_PORT,
-        logical_channel=VIDEO_CHANNEL,
-        data_type=VIDEO_DATA_TYPE,
-        frame_type=VIDEO_FRAME_TYPE,
-    )
-    logger.info(
-        f"[TX] phone={hdr['phone_str']} msgId=0x9101 "
-        f"(StartAV ch={VIDEO_CHANNEL} -> {VIDEO_TARGET_IP}:{VIDEO_TCP_PORT})"
-    )
-    writer.write(pkt_9101)
-    await writer.drain()
+    for ch in range(1, MAX_CHANNELS + 1):
+        pkt_9101 = build_0x9101(
+            hdr["phone_bcd"],
+            session.next_flow(),
+            ip=VIDEO_TARGET_IP,
+            tcp_port=VIDEO_TCP_PORT,
+            udp_port=VIDEO_UDP_PORT,
+            logical_channel=ch,
+            data_type=VIDEO_DATA_TYPE,
+            frame_type=VIDEO_FRAME_TYPE,
+        )
+        logger.info(
+            f"[TX] phone={phone_str} msgId=0x9101 "
+            f"(StartAV ch={ch} -> {VIDEO_TARGET_IP}:{VIDEO_TCP_PORT})"
+        )
+        writer.write(pkt_9101)
+        await writer.drain()
 
-    pkt_9102 = build_0x9102(
-        hdr["phone_bcd"],
-        session.next_flow(),
-        logical_channel=VIDEO_CHANNEL,
-        control_cmd=1,
-        close_av_type=0,
-        switch_stream_type=VIDEO_FRAME_TYPE,
-    )
-    logger.info(
-        f"[TX] phone={hdr['phone_str']} msgId=0x9102 "
-        f"(AVControl START ch={VIDEO_CHANNEL})"
-    )
-    writer.write(pkt_9102)
-    await writer.drain()
+        pkt_9102 = build_0x9102(
+            hdr["phone_bcd"],
+            session.next_flow(),
+            logical_channel=ch,
+            control_cmd=1,
+            close_av_type=0,
+            switch_stream_type=VIDEO_FRAME_TYPE,
+        )
+        logger.info(
+            f"[TX] phone={phone_str} msgId=0x9102 "
+            f"(AVControl START ch={ch})"
+        )
+        writer.write(pkt_9102)
+        await writer.drain()
 
 
 # ========== Loop por conexión TCP (CONTROL 808) ==========
@@ -908,7 +958,7 @@ async def handle_control_client(reader: asyncio.StreamReader,
                         if msg_id == b"\x01\x02":
                             logger.info(
                                 f"[VIDEO] Auth OK para phone={hdr['phone_str']}, "
-                                f"enviando 0x9101/0x9102 para iniciar stream"
+                                f"enviando 0x9101/0x9102 para canales 1..{MAX_CHANNELS}"
                             )
                             await start_video_if_needed(session, hdr, writer)
                     else:
@@ -934,20 +984,12 @@ async def handle_control_client(reader: asyncio.StreamReader,
                 except Exception as ex:
                     logger.exception(f"[ERR] Error manejando frame: {ex}")
 
-            # IMPORTANTE: en el socket de CONTROL NO llamamos feed_h264()
-
     except Exception as e:
         logger.exception(f"[ERR] Error en conexión CONTROL {peer}: {e}")
     finally:
         try:
             if dump_file is not None:
                 dump_file.close()
-        except Exception:
-            pass
-
-        try:
-            if session.h264_pipe is not None:
-                session.h264_pipe.close()
         except Exception:
             pass
 
@@ -969,12 +1011,12 @@ async def handle_video_stream(reader: asyncio.StreamReader,
     logger.info(f"[VID] Nueva conexión de VIDEO en puerto {VIDEO_TCP_PORT} desde {peer}")
     session = SessionState()
 
-    # Si ya conocemos el phone por el puerto de control, lo usamos
     if CURRENT_PHONE:
         session.ensure_phone_and_pipes(CURRENT_PHONE)
     else:
         logger.warning(
-            "[VID] CURRENT_PHONE aún es None, se abrirán FIFOs cuando se conozca."
+            "[VID] CURRENT_PHONE aún es None; se descartan paquetes "
+            "hasta que el CONTROL procese algún 0100/0102/0200."
         )
 
     try:
@@ -983,20 +1025,16 @@ async def handle_video_stream(reader: asyncio.StreamReader,
             if not chunk:
                 break
 
-            # Si se conoce phone pero aún no se inicializó para esta sesión
             if not session.phone_str and CURRENT_PHONE:
                 session.ensure_phone_and_pipes(CURRENT_PHONE)
 
-            # Mandamos todos los bytes al parser JT/T 1078,
-            # que a su vez llama a feed_h264() con solo el cuerpo H.264.
             session.feed_jt1078(chunk)
 
     except Exception as e:
         logger.exception(f"[VID] Error en conexión de video {peer}: {e}")
     finally:
         try:
-            if session.h264_pipe is not None:
-                session.h264_pipe.close()
+            session.close_all_pipes()
         except Exception:
             pass
 
@@ -1005,7 +1043,10 @@ async def handle_video_stream(reader: asyncio.StreamReader,
             await writer.wait_closed()
         except Exception:
             pass
-        logger.info(f"[VID] Conexión de VIDEO cerrada {peer}")
+        logger.info(
+            f"[VID] Conexión de VIDEO cerrada {peer} "
+            f"(phone={session.phone_str})"
+        )
 
 
 # ========== main: ambos servidores en el mismo archivo ==========
