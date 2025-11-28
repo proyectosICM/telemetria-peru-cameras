@@ -434,11 +434,12 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
         logger.warning(f"[HLS] No se pudo crear {HLS_OUTPUT_DIR}: {e}")
         return
 
+    # ⚠️ AQUÍ VA EL CMD CORREGIDO
     cmd = [
         FFMPEG_BIN,
         "-loglevel", "warning",
-        # Generar PTS nuevos y sin buffer gordo
-        "-fflags", "+genpts+nobuffer",
+        # Generar PTS nuevos cuando falten/estén locos
+        "-fflags", "+genpts",
         # Cola de entrada grande para el FIFO
         "-thread_queue_size", "4096",
         # Asumimos que el H.264 viene ~25fps
@@ -453,9 +454,8 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
         # Forzamos salida CFR a 25 fps
         "-r", "25",
         "-f", "hls",
-        # Bajamos latencia: segmentos cortos y pocos en lista
-        "-hls_time", "1",
-        "-hls_list_size", "3",
+        "-hls_time", "2",
+        "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list",
         m3u8_path,
     ]
