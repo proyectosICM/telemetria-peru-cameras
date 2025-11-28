@@ -10,6 +10,8 @@ Hace esto:
       * Auth (0x0102)     -> responde 0x8001 (ACK OK) y envía 0x9101 + 0x9102
       * Heartbeat (0x0002)-> responde 0x8001 (ACK OK)
       * Posición (0x0200) -> log + 0x8001 (ACK OK)
+      * Vídeo (0x341e)    -> extrae solo la parte de payload de vídeo y la pasa
+                             al extractor H.264
   - Envía 0x9101 + 0x9102 por la MISMA conexión/puerto 7200 para pedir video
   - Loguea TODO en hex (logger normal + logger.raw)
   - Guarda TODO el stream crudo (login + video) en archivo por conexión
@@ -345,7 +347,6 @@ def handle_0102_auth(session, hdr, body):
         token = body.decode(errors="ignore") if body else ""
     except Exception:
         token = body.hex()
-        logger.info(f"[0102] Auth phone={hdr['phone_str']} token={token!r}")
     logger.info(f"[0102] Auth phone={hdr['phone_str']} token={token!r}")
     # solo respondemos con 0x8001 OK
     return build_0x8001(
@@ -397,12 +398,51 @@ def handle_0200_position(session, hdr, body):
     )
 
 
+def handle_341e_video(session, hdr, body):
+    """
+    0x341e – (según el log) mensaje de stream de vídeo JT1078.
+
+    IMPORTANTE:
+    - La especificación real de 0x341e incluye un header propio de AV
+      (campos de marca, tipo de stream, canal, etc.)
+    - Aquí hacemos una aproximación: saltamos los primeros 12 bytes
+      como "cabecera AV" y tratamos el resto como payload H.264 que
+      alimentamos al extractor H.264.
+
+    Esto NO es una implementación completa de JT1078, pero al menos
+    evita meter bytes de cabecera (no-H.264) al FIFO.
+    """
+    if not body:
+        return None
+
+    # Número de bytes que consideramos "header" AV de 1078.
+    # 12 es un valor típico (marca + flags + timestamp + etc.)
+    AV_HEADER_LEN = 12
+
+    if len(body) <= AV_HEADER_LEN:
+        # Nada útil que mandar
+        return None
+
+    video_payload = body[AV_HEADER_LEN:]
+
+    # Asegurarnos de que ya está inicializado el phone para FIFOs/HLS
+    session.ensure_phone_and_pipes(hdr["phone_str"])
+
+    # Alimentar SOLO esta parte "vídeo" al extractor H.264
+    session.feed_h264(video_payload)
+
+    # Normalmente 0x341e no requiere respuesta específica, dejamos que el
+    # ACK general opcional para UNKNOWN lo maneje el caller si quiere.
+    return None
+
+
 MSG_HANDLERS = {
     b"\x00\x01": handle_0001_terminal_general_resp,
     b"\x00\x02": handle_0002_heartbeat,
     b"\x01\x00": handle_0100_register,
     b"\x01\x02": handle_0102_auth,
     b"\x02\x00": handle_0200_position,
+    b"\x34\x1e": handle_341e_video,    # <<< nuevo handler para vídeo
 }
 
 
@@ -569,7 +609,10 @@ class SessionState:
             if data[i] == 0 and data[i+1] == 0 and data[i+2] == 1:
                 return i, 3
             # 00 00 00 01
-            if i + 4 <= n and data[i] == 0 and data[i+1] == 0 and data[i+2] == 0 and data[i+3] == 1:
+            if (
+                i + 4 <= n and
+                data[i] == 0 and data[i+1] == 0 and data[i+2] == 0 and data[i+3] == 1
+            ):
                 return i, 4
             i += 1
         return -1, 0
@@ -582,7 +625,8 @@ class SessionState:
         Hasta que no veamos un SPS (nal_type=7) no empezamos a escribir nada.
 
         IMPORTANTE:
-        - Esto tira a la basura todo lo que NO esté entre start-codes H.264.
+        - Esto espera que 'chunk' venga ya de la parte de payload de vídeo
+          de JT1078, NO de todo el TCP.
         """
         if self.pipe_path is None or self.h264_pipe_failed:
             return
@@ -634,10 +678,14 @@ class SessionState:
                 if pipe is not None:
                     pipe.write(out)
             except BrokenPipeError as e:
-                logger.warning(f"[H264] Broken pipe al escribir en {self.pipe_path}: {e}")
+                logger.warning(
+                    f"[H264] Broken pipe al escribir en {self.pipe_path}: {e}"
+                )
                 self._disable_h264_pipe()
             except Exception as e:
-                logger.warning(f"[H264] Error escribiendo en {self.pipe_path}: {e}")
+                logger.warning(
+                    f"[H264] Error escribiendo en {self.pipe_path}: {e}"
+                )
 
 
 async def start_video_if_needed(session: SessionState, hdr, writer):
@@ -742,7 +790,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if len(payload) < 13:
                         continue
 
-                    # Checksum: si falla, no spameamos WARNING, solo ignoramos
+                    # Checksum: si falla, ignoramos frame
                     calc = checksum(payload[:-1])
                     if calc != payload[-1]:
                         continue
@@ -817,12 +865,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception as ex:
                     logger.exception(f"[ERR] Error manejando frame: {ex}")
 
-            # Ahora que probablemente ya tenemos phone_str/pipe_path,
-            # alimentamos el extractor H.264 con el chunk crudo
-            try:
-                session.feed_h264(chunk)
-            except Exception as e:
-                logger.warning(f"[H264] Error en feed_h264: {e}")
+            # OJO: aquí YA NO llamamos session.feed_h264(chunk)
+            # Sólo se llama desde handle_341e_video con el body filtrado.
 
     except Exception as e:
         logger.exception(f"[ERR] Error en conexión {peer}: {e}")
