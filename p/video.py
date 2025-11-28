@@ -100,7 +100,8 @@ def do_escape(raw: bytes) -> bytes:
             out += REVERSE_ESC_MAP[bb]
         else:
             out += bb
-    return out
+    # 👇 IMPORTANTE: devolver bytes, no bytearray
+    return bytes(out)
 
 
 def checksum(data: bytes) -> int:
@@ -487,6 +488,10 @@ class SessionState:
         self.last_sps = None
         self.last_pps = None
 
+        # Flags de debug
+        self.first_video_chunk_logged = False
+        self.jt1078_packet_count = 0
+
     def next_flow(self) -> bytes:
         return self.flow.next()
 
@@ -563,6 +568,14 @@ class SessionState:
             # si ya sabemos que el pipe está muerto y ni siquiera arrancó, no pierdas tiempo
             return
 
+        # Loguear solo el primer chunk que entra por 7201, para ver qué formato trae
+        if not self.first_video_chunk_logged:
+            self.first_video_chunk_logged = True
+            logger.info(
+                f"[VID-RAW] Primer chunk recibido en 7201 len={len(chunk)} "
+                f"hex={chunk[:64].hex()}"
+            )
+
         self.jt1078_buf += chunk
 
         while True:
@@ -573,21 +586,28 @@ class SessionState:
                 return
 
             if buf[0:4] != JT1078_MAGIC:
-                # Buscar la próxima aparición de magic
+                # No empieza por magic, intentar resync
                 idx = buf.find(JT1078_MAGIC, 1)
                 if idx == -1:
                     # conserva solo los últimos 3 bytes por si la magic cae cortada ahí
+                    logger.warning(
+                        f"[JT1078] No se encontró magic en {len(buf)} bytes, "
+                        f"descartando todo menos últimos 3."
+                    )
                     self.jt1078_buf = buf[-3:]
                     return
-                # descarta basura previa
-                self.jt1078_buf = buf[idx:]
-                buf = self.jt1078_buf
+                else:
+                    logger.warning(
+                        f"[JT1078] Basura antes de magic, descartando {idx} bytes."
+                    )
+                    self.jt1078_buf = buf[idx:]
+                    buf = self.jt1078_buf
 
             # Header mínimo
             if len(buf) < JT1078_HEADER_MIN:
                 return
 
-            # data_type (alto nibble) + subpackage (bajo nibble)
+            # data_type (alto nibble) + subpackage (bajo nibble) en offset 15
             data_type_and_sub = buf[15]
             data_type = (data_type_and_sub & 0xF0) >> 4      # 0=I,1=P,2=B,3=audio,4=data...
             sub_flag = data_type_and_sub & 0x0F              # 0=sin subpaquete, 1=first,2=last,3=middle
@@ -604,6 +624,14 @@ class SessionState:
 
             # Avanzar buffer
             self.jt1078_buf = buf[total_len:]
+            self.jt1078_packet_count += 1
+
+            if self.jt1078_packet_count <= 5:
+                logger.info(
+                    f"[JT1078] pkt#{self.jt1078_packet_count} "
+                    f"data_type={data_type} sub_flag={sub_flag} "
+                    f"body_len={body_len}"
+                )
 
             # Solo nos interesan frames de video (I/P/B)
             if data_type in (0, 1, 2):
@@ -611,6 +639,11 @@ class SessionState:
                 self.feed_h264(body)
             else:
                 # audio u otros -> por ahora ignoramos
+                if self.jt1078_packet_count <= 5:
+                    logger.info(
+                        f"[JT1078] pkt#{self.jt1078_packet_count} tipo no-video "
+                        f"(data_type={data_type}), ignorado."
+                    )
                 continue
 
     # ---------- detección de start-codes y limpieza de NALUs ----------
@@ -671,16 +704,25 @@ class SessionState:
             if not self.idr_started:
                 # Antes de arrancar, coleccionamos SPS/PPS y esperamos IDR
                 if nal_type == 7:  # SPS
+                    if not self.sps_seen:
+                        logger.info("[H264] SPS detectado (nal_type=7)")
                     self.sps_seen = True
                     self.last_sps = nalu
                 elif nal_type == 8:  # PPS
+                    if not self.pps_seen:
+                        logger.info("[H264] PPS detectado (nal_type=8)")
                     self.pps_seen = True
                     self.last_pps = nalu
                 elif nal_type == 5:  # IDR
+                    logger.info(
+                        f"[H264] IDR detectado (nal_type=5), "
+                        f"sps_seen={self.sps_seen} pps_seen={self.pps_seen}"
+                    )
                     # Sólo arrancamos si ya tenemos SPS+PPS
                     if self.sps_seen and self.pps_seen:
                         self.idr_started = True
                         self.h264_started = True
+                        logger.info("[H264] Arrancando stream bueno (SPS+PPS+IDR)")
                         # Metemos SPS + PPS + este IDR al output
                         if self.last_sps:
                             out += self.last_sps
@@ -706,6 +748,11 @@ class SessionState:
                 pipe = self.ensure_h264_pipe()
                 if pipe is not None:
                     pipe.write(out)
+                    # Para debug, loguear solo cuando recién empezamos a escribir
+                    if self.h264_started:
+                        logger.info(
+                            f"[H264] Escribiendo {len(out)} bytes al FIFO {self.pipe_path}"
+                        )
             except BrokenPipeError as e:
                 logger.warning(
                     f"[H264] Broken pipe al escribir en {self.pipe_path}: {e}"
