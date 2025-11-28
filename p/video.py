@@ -464,10 +464,19 @@ class SessionState:
 
         self.phone_str = None
         self.pipe_path = None
-        self.h264_started = False
+
+        # Estado H.264
+        self.h264_started = False          # stream "bueno" ya arrancó
         self.h264_pipe = None
         self.h264_pipe_failed = False
         self.h264_buf = b""
+
+        # Tracking de SPS / PPS / IDR
+        self.sps_seen = False
+        self.pps_seen = False
+        self.idr_started = False
+        self.last_sps = None
+        self.last_pps = None
 
     def next_flow(self) -> bytes:
         return self.flow.next()
@@ -553,9 +562,11 @@ class SessionState:
         """
         Extrae NALUs H.264 válidos y los escribe en el FIFO:
 
-        - Espera a ver un SPS (nal_type == 7) para empezar.
-        - Luego solo deja pasar nal_type en rango 1..23 (NALs válidos H.264).
-        - Descarta NALs raros (0, 24–31) que podrían ser basura / headers raros.
+        - Espera a ver SPS (7) y PPS (8).
+        - Luego espera un IDR (5).
+        - Recién ahí arranca el stream "bueno" escribiendo:
+            SPS + PPS + IDR
+        - A partir de entonces sólo deja pasar nal_type en 1..23.
         """
         if self.pipe_path is None or self.h264_pipe_failed:
             return
@@ -586,17 +597,32 @@ class SessionState:
             else:
                 nal_type = -1
 
-            if not self.h264_started:
-                # Solo arrancamos cuando el primer NAL útil es SPS
+            if not self.idr_started:
+                # Antes de arrancar, coleccionamos SPS/PPS y esperamos IDR
                 if nal_type == 7:  # SPS
-                    self.h264_started = True
-                    out += nalu
+                    self.sps_seen = True
+                    self.last_sps = nalu
+                elif nal_type == 8:  # PPS
+                    self.pps_seen = True
+                    self.last_pps = nalu
+                elif nal_type == 5:  # IDR
+                    # Sólo arrancamos si ya tenemos SPS+PPS
+                    if self.sps_seen and self.pps_seen:
+                        self.idr_started = True
+                        self.h264_started = True
+                        # Metemos SPS + PPS + este IDR al output
+                        if self.last_sps:
+                            out += self.last_sps
+                        if self.last_pps:
+                            out += self.last_pps
+                        out += nalu
+                # Cualquier otra cosa antes del primer IDR limpio se tira
             else:
-                # Solo aceptamos NALU con tipo válido (1..23)
+                # Stream ya arrancado: sólo tipos válidos 1..23
                 if 1 <= nal_type <= 23:
                     out += nalu
                 else:
-                    # NAL extraño (0, 24–31), se descarta silenciosamente
+                    # NAL raro (0, 24–31), lo ignoramos
                     pass
 
             pos = next_pos
