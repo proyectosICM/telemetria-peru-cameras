@@ -100,7 +100,7 @@ def do_escape(raw: bytes) -> bytes:
             out += REVERSE_ESC_MAP[bb]
         else:
             out += bb
-    # 👇 IMPORTANTE: devolver bytes, no bytearray
+    # IMPORTANTE: devolver bytes, no bytearray
     return bytes(out)
 
 
@@ -434,16 +434,25 @@ def start_hls_for_phone(phone_str: str, channel: int = VIDEO_CHANNEL):
         logger.warning(f"[HLS] No se pudo crear {HLS_OUTPUT_DIR}: {e}")
         return
 
+    # ⚠️ AQUÍ VA EL CMD CORREGIDO
     cmd = [
         FFMPEG_BIN,
         "-loglevel", "warning",
-        "-fflags", "+genpts+nobuffer",
-        "-flags", "low_delay",
+        # Generar PTS nuevos cuando falten/estén locos
+        "-fflags", "+genpts",
+        # Cola de entrada grande para el FIFO
         "-thread_queue_size", "4096",
+        # Asumimos que el H.264 viene ~25fps
+        "-framerate", "25",
         "-i", fifo_path,
+        # Solo video, sin audio
+        "-an",
+        # Reencodear para tener timing limpio y compatible
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
+        # Forzamos salida CFR a 25 fps
+        "-r", "25",
         "-f", "hls",
         "-hls_time", "2",
         "-hls_list_size", "5",
