@@ -1,0 +1,7 @@
+FROM ghcr.io/proyectosicm/telemetria-peru-cameras:latest
+
+WORKDIR /app
+
+COPY p/video.py ./p/video.py
+
+CMD ["python", "p/video.py"]
