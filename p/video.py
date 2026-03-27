@@ -33,6 +33,7 @@ ALWAYS_ACK_UNKNOWN = True
 ENABLE_CONTROL_RAW_DUMP = os.getenv("ENABLE_CONTROL_RAW_DUMP") == "1"
 COMMAND_API_TOKEN = os.getenv("COMMAND_API_TOKEN", "").strip()
 COMMAND_ACK_TIMEOUT_SECONDS = float(os.getenv("COMMAND_ACK_TIMEOUT_SECONDS", "5"))
+ALARM_PARAM_ID = int(os.getenv("ALARM_PARAM_ID", "0x00FF0001"), 0)
 
 # Fallback para asociar video por peer si todavia no hay mapping mejor.
 CURRENT_PHONE = None
@@ -69,7 +70,13 @@ DEFAULT_DVR_ALERTS = [
         "description": "Pulso manual de alarma del DVR.",
         "durationSecondsDefault": 3,
         "requiresChannel": False,
-        "command": None,
+        "command": {
+            "kind": "set_param_u8",
+            "paramId": ALARM_PARAM_ID,
+            "onValue": 1,
+            "offValue": 0,
+            "durationSeconds": 3,
+        },
     },
     {
         "code": "adas_warning",
@@ -81,22 +88,46 @@ DEFAULT_DVR_ALERTS = [
             {
                 "code": "fatigue",
                 "name": "Fatiga",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
             {
                 "code": "distraction",
                 "name": "Distraccion",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
             {
                 "code": "lane_departure",
                 "name": "Cambio de carril",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
             {
                 "code": "collision_warning",
                 "name": "Colision frontal",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
         ],
     },
@@ -110,17 +141,35 @@ DEFAULT_DVR_ALERTS = [
             {
                 "code": "smoking",
                 "name": "Fumar",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
             {
                 "code": "phone_use",
                 "name": "Uso de celular",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
             {
                 "code": "camera_blocked",
                 "name": "Camara bloqueada",
-                "command": None,
+                "command": {
+                    "kind": "set_param_u8",
+                    "paramId": ALARM_PARAM_ID,
+                    "onValue": 1,
+                    "offValue": 0,
+                    "durationSeconds": 3,
+                },
             },
         ],
     },
