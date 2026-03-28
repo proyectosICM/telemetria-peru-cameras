@@ -67,15 +67,13 @@ DEFAULT_DVR_ALERTS = [
     {
         "code": "manual_emergency",
         "name": "Emergencia manual",
-        "description": "Pulso manual de alarma del DVR.",
+        "description": "Aviso de emergencia por TTS en el terminal.",
         "durationSecondsDefault": 3,
         "requiresChannel": False,
         "command": {
-            "kind": "set_param_u8",
-            "paramId": ALARM_PARAM_ID,
-            "onValue": 1,
-            "offValue": 0,
-            "durationSeconds": 3,
+            "kind": "text_tts",
+            "flags": 0x0D,
+            "text": "Emergencia manual",
         },
     },
     {
@@ -89,44 +87,36 @@ DEFAULT_DVR_ALERTS = [
                 "code": "fatigue",
                 "name": "Fatiga",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "Alerta de fatiga",
                 },
             },
             {
                 "code": "distraction",
                 "name": "Distraccion",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "Alerta de distraccion",
                 },
             },
             {
                 "code": "lane_departure",
                 "name": "Cambio de carril",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "Alerta de cambio de carril",
                 },
             },
             {
                 "code": "collision_warning",
                 "name": "Colision frontal",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "Alerta de colision frontal",
                 },
             },
         ],
@@ -142,33 +132,27 @@ DEFAULT_DVR_ALERTS = [
                 "code": "smoking",
                 "name": "Fumar",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "No fumar mientras conduce",
                 },
             },
             {
                 "code": "phone_use",
                 "name": "Uso de celular",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "No use el celular al conducir",
                 },
             },
             {
                 "code": "camera_blocked",
                 "name": "Camara bloqueada",
                 "command": {
-                    "kind": "set_param_u8",
-                    "paramId": ALARM_PARAM_ID,
-                    "onValue": 1,
-                    "offValue": 0,
-                    "durationSeconds": 3,
+                    "kind": "text_tts",
+                    "flags": 0x0C,
+                    "text": "Camara bloqueada",
                 },
             },
         ],
@@ -375,6 +359,13 @@ def build_0x8103_single_param(phone_bcd: bytes, flow_id_platform: bytes, param_i
     body.append(len(value_bytes))
     body += value_bytes
     return build_downlink(b"\x81\x03", phone_bcd, flow_id_platform, bytes(body))
+
+
+def build_0x8300_text_message(phone_bcd: bytes, flow_id_platform: bytes, flags: int, text: str):
+    body = bytearray()
+    body.append(flags & 0xFF)
+    body += text.encode("gbk", errors="replace")
+    return build_downlink(b"\x83\x00", phone_bcd, flow_id_platform, bytes(body))
 
 
 def build_0x9101(
@@ -1008,6 +999,22 @@ def build_command_frames(session_ctx: ControlSessionContext, *, alert_code: str,
                     "pause_after": effective_duration,
                 }
             )
+        return frames
+
+    if kind == "text_tts":
+        text_value = str(command.get("text") or "").strip()
+        if not text_value:
+            raise ValueError(f"Alerta {alert_code}/{subalert_code or '-'} no tiene texto configurado")
+        flags = parse_intish(command.get("flags"), default=0x0C)
+        flow_id = session_ctx.session.next_flow()
+        frames.append(
+            {
+                "msg_id_hex": "8300",
+                "flow_id_int": int.from_bytes(flow_id, "big"),
+                "frame": build_0x8300_text_message(session_ctx.phone_bcd, flow_id, flags, text_value),
+                "wait_ack": True,
+            }
+        )
         return frames
 
     if kind == "av_control":
