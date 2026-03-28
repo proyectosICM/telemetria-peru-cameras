@@ -2,12 +2,14 @@
 """
 video.py - Servidor JT808/JT1078 con:
 
-- Puerto 7200 (CONTROL JT808)
+- Puerto 7200 (CONTROL VIDEO JT808)
+- Puerto 6808 (CONTROL COMANDOS JT808)
 - Puerto 7201 (VIDEO JT1078)
 - Puerto HTTP interno para catalogo/ejecucion de comandos DVR
 
-El objetivo es aislar cada DVR por su propia sesion de control y enviar
-comandos de forma serial por dvrPhone, evitando cruces entre equipos.
+El objetivo es aislar cada DVR por su propia sesion de video y su propia
+sesion de comandos, enviando comandos de forma serial por dvrPhone sin
+cruzarlos con el canal usado para levantar video.
 """
 
 import asyncio
@@ -24,7 +26,8 @@ from urllib.parse import parse_qs, urlparse
 # ========== Config basica ==========
 
 HOST = "0.0.0.0"
-CONTROL_PORT = 7200
+VIDEO_CONTROL_PORT = int(os.getenv("VIDEO_CONTROL_PORT", "7200"))
+COMMAND_CONTROL_PORT = int(os.getenv("COMMAND_CONTROL_PORT", "6808"))
 VIDEO_TCP_PORT = 7201
 VIDEO_UDP_PORT = 7201
 COMMAND_HTTP_PORT = int(os.getenv("COMMAND_HTTP_PORT", "7302"))
@@ -718,18 +721,33 @@ def start_hls_for_phone(phone_str: str, channel: int):
 
 
 class ControlSessionContext:
-    def __init__(self, phone_str: str, phone_bcd: bytes, session: SessionState, writer: asyncio.StreamWriter, peer):
+    def __init__(
+        self,
+        phone_str: str,
+        phone_bcd: bytes,
+        session: SessionState,
+        writer: asyncio.StreamWriter,
+        peer,
+        *,
+        registry_name: str,
+        listen_port: int,
+    ):
         self.phone_str = phone_str
         self.phone_bcd = phone_bcd
         self.session = session
         self.writer = writer
         self.peer = peer
+        self.registry_name = registry_name
+        self.listen_port = listen_port
         self.created_at = utc_now_iso()
         self.last_seen_at = self.created_at
         self.pending_acks = {}
         self.command_queue = asyncio.Queue()
         self.closed = False
-        self.worker_task = asyncio.create_task(self._command_worker(), name=f"dvr-cmd-{phone_str}")
+        self.worker_task = asyncio.create_task(
+            self._command_worker(),
+            name=f"dvr-{registry_name}-{phone_str}",
+        )
 
     def touch(self):
         self.last_seen_at = utc_now_iso()
@@ -798,7 +816,8 @@ class ControlSessionContext:
         await self.writer.drain()
 
         logger.info(
-            f"[CMD] phone={self.phone_str} msgId=0x{msg_id_hex} "
+            f"[CMD] registry={self.registry_name} port={self.listen_port} "
+            f"phone={self.phone_str} msgId=0x{msg_id_hex} "
             f"flow={flow_id_int} bytes={len(frame)}"
         )
 
@@ -842,13 +861,24 @@ class ControlSessionContext:
         if self.worker_task and not self.worker_task.done():
             self.worker_task.cancel()
 
-
-CONTROL_SESSIONS = {}
+VIDEO_CONTROL_SESSIONS = {}
+COMMAND_CONTROL_SESSIONS = {}
 PEER_PHONE_INDEX = {}
 REGISTRY_LOCK = asyncio.Lock()
 
 
-async def register_control_session(phone_str: str, phone_bcd: bytes, session: SessionState, writer: asyncio.StreamWriter, peer):
+async def register_control_session(
+    phone_str: str,
+    phone_bcd: bytes,
+    session: SessionState,
+    writer: asyncio.StreamWriter,
+    peer,
+    *,
+    registry_name: str,
+    registry: dict,
+    peer_index: dict | None = None,
+    listen_port: int,
+):
     global CURRENT_PHONE
 
     normalized_phone = normalize_phone(phone_str)
@@ -856,7 +886,7 @@ async def register_control_session(phone_str: str, phone_bcd: bytes, session: Se
         return None
 
     async with REGISTRY_LOCK:
-        existing = CONTROL_SESSIONS.get(normalized_phone)
+        existing = registry.get(normalized_phone)
         if existing is not None and existing.writer is not writer:
             existing.close("sesion reemplazada por nueva conexion")
 
@@ -866,22 +896,40 @@ async def register_control_session(phone_str: str, phone_bcd: bytes, session: Se
             existing.touch()
             ctx = existing
         else:
-            ctx = ControlSessionContext(normalized_phone, phone_bcd, session, writer, peer)
-            CONTROL_SESSIONS[normalized_phone] = ctx
+            ctx = ControlSessionContext(
+                normalized_phone,
+                phone_bcd,
+                session,
+                writer,
+                peer,
+                registry_name=registry_name,
+                listen_port=listen_port,
+            )
+            registry[normalized_phone] = ctx
 
         session.phone_str = normalized_phone
         session.phone_bcd = phone_bcd
         session.control_context = ctx
-        CURRENT_PHONE = normalized_phone
+        if peer_index is not None:
+            CURRENT_PHONE = normalized_phone
 
-        if peer and peer[0]:
-            PEER_PHONE_INDEX[str(peer[0])] = normalized_phone
+        if peer_index is not None and peer and peer[0]:
+            peer_index[str(peer[0])] = normalized_phone
 
-        logger.info(f"[REGISTRY] Session registrada phone={normalized_phone} peer={peer}")
+        logger.info(
+            f"[REGISTRY] registry={registry_name} port={listen_port} "
+            f"phone={normalized_phone} peer={peer}"
+        )
         return ctx
 
 
-async def unregister_control_session(phone_str: str | None, writer: asyncio.StreamWriter):
+async def unregister_control_session(
+    phone_str: str | None,
+    writer: asyncio.StreamWriter,
+    *,
+    registry_name: str,
+    registry: dict,
+):
     if not phone_str:
         return
     normalized_phone = normalize_phone(phone_str)
@@ -889,19 +937,19 @@ async def unregister_control_session(phone_str: str | None, writer: asyncio.Stre
         return
 
     async with REGISTRY_LOCK:
-        ctx = CONTROL_SESSIONS.get(normalized_phone)
+        ctx = registry.get(normalized_phone)
         if ctx is not None and ctx.writer is writer:
             ctx.close("conexion cerrada")
-            CONTROL_SESSIONS.pop(normalized_phone, None)
-            logger.info(f"[REGISTRY] Session removida phone={normalized_phone}")
+            registry.pop(normalized_phone, None)
+            logger.info(f"[REGISTRY] Session removida registry={registry_name} phone={normalized_phone}")
 
 
-async def get_control_session(phone_str: str | None):
+async def get_control_session(phone_str: str | None, *, registry: dict):
     normalized_phone = normalize_phone(phone_str)
     if not normalized_phone:
         return None
     async with REGISTRY_LOCK:
-        return CONTROL_SESSIONS.get(normalized_phone)
+        return registry.get(normalized_phone)
 
 
 async def get_phone_for_peer(peer):
@@ -1127,11 +1175,31 @@ MSG_HANDLERS = {
 }
 
 
-async def bind_control_session(session: SessionState, hdr, writer: asyncio.StreamWriter, peer):
+async def bind_control_session(
+    session: SessionState,
+    hdr,
+    writer: asyncio.StreamWriter,
+    peer,
+    *,
+    registry_name: str,
+    registry: dict,
+    peer_index: dict | None = None,
+    listen_port: int,
+):
     normalized_phone = normalize_phone(hdr["phone_str"])
     if not normalized_phone:
         return None
-    ctx = await register_control_session(normalized_phone, hdr["phone_bcd"], session, writer, peer)
+    ctx = await register_control_session(
+        normalized_phone,
+        hdr["phone_bcd"],
+        session,
+        writer,
+        peer,
+        registry_name=registry_name,
+        registry=registry,
+        peer_index=peer_index,
+        listen_port=listen_port,
+    )
     if ctx is not None:
         ctx.touch()
     return ctx
@@ -1245,20 +1313,21 @@ async def handle_command_http_client(reader: asyncio.StreamReader, writer: async
 
         if method == "GET" and parsed.path == "/health":
             await write_http_response(
-                writer,
-                200,
-                {
-                    "status": "ok",
-                    "controlPort": CONTROL_PORT,
-                    "videoPort": VIDEO_TCP_PORT,
-                    "commandPort": COMMAND_HTTP_PORT,
-                },
-            )
+                    writer,
+                    200,
+                    {
+                        "status": "ok",
+                        "videoControlPort": VIDEO_CONTROL_PORT,
+                        "commandControlPort": COMMAND_CONTROL_PORT,
+                        "videoPort": VIDEO_TCP_PORT,
+                        "commandHttpPort": COMMAND_HTTP_PORT,
+                    },
+                )
             return
 
         if method == "GET" and parsed.path == "/dvr-alerts":
             phone = query.get("phone", [None])[0]
-            session_ctx = await get_control_session(phone)
+            session_ctx = await get_control_session(phone, registry=COMMAND_CONTROL_SESSIONS)
             await write_http_response(writer, 200, build_catalog_response(phone, session_ctx))
             return
 
@@ -1279,7 +1348,7 @@ async def handle_command_http_client(reader: asyncio.StreamReader, writer: async
                 await write_http_response(writer, 400, {"error": "phone y alertCode son obligatorios"})
                 return
 
-            session_ctx = await get_control_session(phone)
+            session_ctx = await get_control_session(phone, registry=COMMAND_CONTROL_SESSIONS)
             if session_ctx is None:
                 await write_http_response(
                     writer,
@@ -1369,7 +1438,16 @@ async def handle_command_http_client(reader: asyncio.StreamReader, writer: async
             pass
 
 
-async def handle_control_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+async def handle_control_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    registry_name: str,
+    registry: dict,
+    listen_port: int,
+    start_video_on_auth: bool,
+    peer_index: dict | None = None,
+):
     sock = writer.get_extra_info("socket")
     if isinstance(sock, socket.socket):
         try:
@@ -1378,7 +1456,7 @@ async def handle_control_client(reader: asyncio.StreamReader, writer: asyncio.St
             pass
 
     peer = writer.get_extra_info("peername")
-    logger.info(f"[CONN] Nueva conexion CONTROL en puerto {CONTROL_PORT} desde {peer}")
+    logger.info(f"[CONN] Nueva conexion CONTROL registry={registry_name} puerto {listen_port} desde {peer}")
     session = SessionState()
     buf = b""
 
@@ -1428,7 +1506,16 @@ async def handle_control_client(reader: asyncio.StreamReader, writer: asyncio.St
                         continue
 
                     hdr = parse_header(payload[:-1])
-                    await bind_control_session(session, hdr, writer, peer)
+                    await bind_control_session(
+                        session,
+                        hdr,
+                        writer,
+                        peer,
+                        registry_name=registry_name,
+                        registry=registry,
+                        peer_index=peer_index,
+                        listen_port=listen_port,
+                    )
 
                     body = payload[:-1][hdr["body_idx"]:hdr["body_idx"] + hdr["body_len"]]
                     hex_payload = binascii.hexlify(payload).decode()
@@ -1447,13 +1534,14 @@ async def handle_control_client(reader: asyncio.StreamReader, writer: asyncio.St
                         resp = handler(session, hdr, body)
                         if resp:
                             logger.info(
-                                f"[TX] phone={hdr['phone_str']} resp_for=0x{hdr['msg_id'].hex()} "
+                                f"[TX] registry={registry_name} port={listen_port} "
+                                f"phone={hdr['phone_str']} resp_for=0x{hdr['msg_id'].hex()} "
                                 f"flow={int.from_bytes(hdr['flow_id'], 'big')}"
                             )
                             writer.write(resp)
                             await writer.drain()
 
-                        if msg_id == b"\x01\x02":
+                        if msg_id == b"\x01\x02" and start_video_on_auth:
                             logger.info(
                                 f"[VIDEO] Auth OK para phone={hdr['phone_str']}, "
                                 f"enviando 0x9101/0x9102 para canales {VIDEO_CHANNELS}"
@@ -1485,14 +1573,19 @@ async def handle_control_client(reader: asyncio.StreamReader, writer: asyncio.St
         except Exception:
             pass
 
-        await unregister_control_session(session.phone_str, writer)
+        await unregister_control_session(
+            session.phone_str,
+            writer,
+            registry_name=registry_name,
+            registry=registry,
+        )
 
         try:
             writer.close()
             await writer.wait_closed()
         except Exception:
             pass
-        logger.info(f"[CONN] Conexion CONTROL cerrada {peer}")
+        logger.info(f"[CONN] Conexion CONTROL cerrada registry={registry_name} puerto {listen_port} {peer}")
 
 
 async def handle_video_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -1536,12 +1629,39 @@ async def handle_video_stream(reader: asyncio.StreamReader, writer: asyncio.Stre
 
 
 async def main():
-    control_server = await asyncio.start_server(handle_control_client, HOST, CONTROL_PORT)
+    video_control_server = await asyncio.start_server(
+        lambda reader, writer: handle_control_client(
+            reader,
+            writer,
+            registry_name="video-control",
+            registry=VIDEO_CONTROL_SESSIONS,
+            listen_port=VIDEO_CONTROL_PORT,
+            start_video_on_auth=True,
+            peer_index=PEER_PHONE_INDEX,
+        ),
+        HOST,
+        VIDEO_CONTROL_PORT,
+    )
+    command_control_server = await asyncio.start_server(
+        lambda reader, writer: handle_control_client(
+            reader,
+            writer,
+            registry_name="command-control",
+            registry=COMMAND_CONTROL_SESSIONS,
+            listen_port=COMMAND_CONTROL_PORT,
+            start_video_on_auth=False,
+        ),
+        HOST,
+        COMMAND_CONTROL_PORT,
+    )
     video_server = await asyncio.start_server(handle_video_stream, HOST, VIDEO_TCP_PORT)
     command_server = await asyncio.start_server(handle_command_http_client, HOST, COMMAND_HTTP_PORT)
 
-    addrs = ", ".join(str(s.getsockname()) for s in control_server.sockets)
-    logger.info(f"[MAIN] Servidor CONTROL JT808 escuchando en {addrs}")
+    video_ctrl_addrs = ", ".join(str(s.getsockname()) for s in video_control_server.sockets)
+    logger.info(f"[MAIN] Servidor CONTROL VIDEO JT808 escuchando en {video_ctrl_addrs}")
+
+    command_ctrl_addrs = ", ".join(str(s.getsockname()) for s in command_control_server.sockets)
+    logger.info(f"[MAIN] Servidor CONTROL COMANDOS JT808 escuchando en {command_ctrl_addrs}")
 
     v_addrs = ", ".join(str(s.getsockname()) for s in video_server.sockets)
     logger.info(f"[MAIN] Servidor VIDEO escuchando en {v_addrs}")
@@ -1549,9 +1669,10 @@ async def main():
     c_addrs = ", ".join(str(s.getsockname()) for s in command_server.sockets)
     logger.info(f"[MAIN] API interna de comandos DVR escuchando en {c_addrs}")
 
-    async with control_server, video_server, command_server:
+    async with video_control_server, command_control_server, video_server, command_server:
         await asyncio.gather(
-            control_server.serve_forever(),
+            video_control_server.serve_forever(),
+            command_control_server.serve_forever(),
             video_server.serve_forever(),
             command_server.serve_forever(),
         )
