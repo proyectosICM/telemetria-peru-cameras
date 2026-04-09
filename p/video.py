@@ -71,6 +71,7 @@ VIDEO_CHANNELS = [
     if 1 <= ch <= MAX_CHANNELS
 ]
 AUTO_START_VIDEO_ON_AUTH = os.getenv("AUTO_START_VIDEO_ON_AUTH", "1") != "0"
+AUTO_START_VIDEO_WAIT_FOR_POSITION = os.getenv("AUTO_START_VIDEO_WAIT_FOR_POSITION", "1") != "0"
 AUTO_START_VIDEO_CHANNELS = [
     ch
     for ch in (
@@ -87,6 +88,13 @@ FFMPEG_BIN = "/usr/bin/ffmpeg"
 CHANNEL_IDLE_TIMEOUT_SECONDS = float(os.getenv("CHANNEL_IDLE_TIMEOUT_SECONDS", "20"))
 CHANNEL_REAPER_INTERVAL_SECONDS = float(os.getenv("CHANNEL_REAPER_INTERVAL_SECONDS", "5"))
 HLS_DRAIN_SECONDS = float(os.getenv("HLS_DRAIN_SECONDS", "1.5"))
+VIDEO_START_AFTER_0704_COOLDOWN_SECONDS = float(
+    os.getenv("VIDEO_START_AFTER_0704_COOLDOWN_SECONDS", "5")
+)
+VIDEO_START_AFTER_0704_MAX_WAIT_SECONDS = float(
+    os.getenv("VIDEO_START_AFTER_0704_MAX_WAIT_SECONDS", "0.75")
+)
+ENABLE_VIDEO_STATUS_NOTIFY = os.getenv("ENABLE_VIDEO_STATUS_NOTIFY", "0") == "1"
 
 # Un ffmpeg por phone+canal
 FFMPEG_PROCS = {}
@@ -208,6 +216,59 @@ def load_dvr_alerts():
 
 DVR_ALERTS = load_dvr_alerts()
 
+
+def normalize_phone_loose(raw_phone: str | None) -> str | None:
+    if not raw_phone:
+        return None
+    digits = "".join(ch for ch in str(raw_phone) if ch.isdigit())
+    if not digits:
+        return None
+    if len(digits) < 12:
+        digits = ("0" * (12 - len(digits))) + digits
+    elif len(digits) > 12:
+        digits = digits[-12:]
+    return digits
+
+
+def load_auth_code_overrides():
+    raw = os.getenv("JT808_AUTH_CODE_OVERRIDES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.warning(f"[AUTH] No se pudo parsear JT808_AUTH_CODE_OVERRIDES_JSON: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("[AUTH] JT808_AUTH_CODE_OVERRIDES_JSON no es un objeto, se ignora")
+        return {}
+    overrides = {}
+    for phone, token in data.items():
+        phone_str = normalize_phone_loose(str(phone))
+        if not phone_str:
+            continue
+        overrides[phone_str] = str(token)
+    return overrides
+
+
+JT808_AUTH_CODE_OVERRIDES = load_auth_code_overrides()
+JT808_AUTH_CODE_PREFIX = os.getenv("JT808_AUTH_CODE_PREFIX", "83")
+JT808_AUTH_CODE_TRIM_DIGITS = max(0, int(os.getenv("JT808_AUTH_CODE_TRIM_DIGITS", "1")))
+ISSUED_AUTH_CODES = {}
+
+
+def build_auth_code_for_phone(phone_str: str) -> str:
+    normalized_phone = normalize_phone_loose(phone_str)
+    if not normalized_phone:
+        return ""
+    override = JT808_AUTH_CODE_OVERRIDES.get(normalized_phone)
+    if override is not None:
+        return override
+    base = normalized_phone
+    if JT808_AUTH_CODE_TRIM_DIGITS > 0 and len(base) > JT808_AUTH_CODE_TRIM_DIGITS:
+        base = base[:-JT808_AUTH_CODE_TRIM_DIGITS]
+    return f"{JT808_AUTH_CODE_PREFIX}{base}"
+
 # ========== Framing / escape JT808 ==========
 
 START_END = b"\x7e"
@@ -224,7 +285,8 @@ JT1078_PHONE_BCD_LEN = 6
 JT1078_LOGICAL_CHANNEL_OFFSET = 14
 JT1078_DATA_TYPE_OFFSET = 15
 JT1078_BODY_LEN_OFFSET = 28
-JT1078_ALT_BODY_LEN_OFFSET = 30
+JT1078_BODY_OFFSET = JT1078_BODY_LEN_OFFSET + 2
+JT1078_MAX_BODY_LEN = int(os.getenv("JT1078_MAX_BODY_LEN", "2048"))
 
 
 def utc_now_iso() -> str:
@@ -542,12 +604,31 @@ class SessionState:
             return None
         state = self.channels.get(logical_channel)
         if state is None:
-            state = ChannelState(self.phone_str, logical_channel)
+            key = f"{self.phone_str}_{logical_channel}"
+            state = CHANNEL_STATES.get(key)
+            if state is None:
+                state = ChannelState(self.phone_str, logical_channel)
+                CHANNEL_STATES[state.key] = state
             self.channels[logical_channel] = state
-            CHANNEL_STATES[state.key] = state
         return state
 
     def close_all_pipes(self):
+        for key, pending in list(self.jt1078_reassembly.items()):
+            if not pending:
+                continue
+            try:
+                logical_channel = int(str(key).rsplit("_", 1)[1])
+            except Exception:
+                logger.warning(f"[JT1078] No se pudo resolver canal para flush final key={key}")
+                continue
+            ch_state = self.get_channel_state(logical_channel)
+            if ch_state is None:
+                continue
+            logger.info(
+                f"[JT1078] Flush final de reensamblado pendiente "
+                f"phone={self.phone_str} ch={logical_channel} bytes={len(pending)}"
+            )
+            ch_state.feed_h264(bytes(pending))
         for st in self.channels.values():
             try:
                 st.feed_h264(b"", final=True)
@@ -555,12 +636,18 @@ class SessionState:
                 logger.warning(
                     f"[H264] Flush final fallido phone={st.phone_str} ch={st.channel}: {exc}"
                 )
-            drain_seconds = HLS_DRAIN_SECONDS if st.h264_started else 0.0
+            if st.h264_started:
+                logger.info(
+                    f"[H264] Preservando canal phone={st.phone_str} ch={st.channel} "
+                    f"tras cierre de socket 7201; se esperara reconexion o timeout"
+                )
+                st.touch()
+                continue
             st.close(
                 "sesion de video cerrada",
-                cleanup_outputs=not st.h264_started,
-                drain_seconds=drain_seconds,
-                stop_hls=not st.h264_started,
+                cleanup_outputs=True,
+                drain_seconds=0.0,
+                stop_hls=True,
             )
             CHANNEL_STATES.pop(st.key, None)
         self.channels.clear()
@@ -588,20 +675,25 @@ class SessionState:
         return payload
 
     def extract_jt1078_body(self, packet: bytes) -> tuple[bytes | None, int | None]:
-        for body_len_off in (JT1078_BODY_LEN_OFFSET, JT1078_ALT_BODY_LEN_OFFSET):
-            if len(packet) < body_len_off + 2:
-                continue
-            body_len = int.from_bytes(
-                packet[body_len_off:body_len_off + 2],
-                "big",
-                signed=False,
+        if len(packet) < JT1078_BODY_OFFSET:
+            return None, None
+
+        body_len = int.from_bytes(
+            packet[JT1078_BODY_LEN_OFFSET:JT1078_BODY_LEN_OFFSET + 2],
+            "big",
+            signed=False,
+        )
+        if body_len <= 0 or body_len > JT1078_MAX_BODY_LEN:
+            logger.warning(
+                f"[JT1078] body_len invalido={body_len} phone={self.phone_str} "
+                f"buf_len={len(packet)}"
             )
-            body_off = body_len_off + 2
-            total_len = body_off + body_len
-            if body_len <= 0 or len(packet) < total_len:
-                continue
-            return packet[body_off:total_len], total_len
-        return None, None
+            return b"", 4
+
+        total_len = JT1078_BODY_OFFSET + body_len
+        if len(packet) < total_len:
+            return None, None
+        return packet[JT1078_BODY_OFFSET:total_len], total_len
 
     def feed_jt1078(self, chunk: bytes):
         if not self.first_video_chunk_logged:
@@ -649,6 +741,9 @@ class SessionState:
             body, total_len = self.extract_jt1078_body(buf)
             if body is None or total_len is None:
                 return
+            if body == b"" and total_len == 4:
+                self.jt1078_buf = buf[total_len:]
+                continue
             self.jt1078_buf = buf[total_len:]
             self.jt1078_packet_count += 1
 
@@ -736,7 +831,7 @@ class ChannelState:
             except Exception:
                 pass
         self.h264_pipe = None
-        if drain_seconds > 0:
+        if drain_seconds > 0 and stop_hls:
             logger.info(
                 f"[HLS] Esperando drenaje final phone={self.phone_str} ch={self.channel} "
                 f"for {drain_seconds:.1f}s antes de detener ffmpeg"
@@ -791,7 +886,7 @@ class ChannelState:
 
         self.touch()
         now = time.monotonic()
-        if now - self.last_status_notify_monotonic >= 5:
+        if ENABLE_VIDEO_STATUS_NOTIFY and now - self.last_status_notify_monotonic >= 5:
             self.last_status_notify_monotonic = now
             asyncio.create_task(
                 notify_video_status(self.phone_str, self.channel, packet_loss_rate=0)
@@ -1046,6 +1141,29 @@ async def ensure_video_channels(phone: str | None, channels: list[int]):
     session_ctx = await get_control_session(phone, registry=VIDEO_CONTROL_SESSIONS)
     if session_ctx is None:
         raise RuntimeError("DVR sin sesion de video-control activa")
+    total_wait = 0.0
+    while True:
+        remaining_cooldown = session_ctx.remaining_0704_cooldown()
+        if remaining_cooldown <= 0:
+            break
+        wait_now = remaining_cooldown
+        if VIDEO_START_AFTER_0704_MAX_WAIT_SECONDS > 0:
+            remaining_budget = VIDEO_START_AFTER_0704_MAX_WAIT_SECONDS - total_wait
+            if remaining_budget <= 0:
+                logger.info(
+                    f"[VIDEO] Iniciando video sin esperar mas phone={session_ctx.phone_str} "
+                    f"aunque siga 0x0704 activo"
+                )
+                break
+            wait_now = min(wait_now, remaining_budget)
+        logger.info(
+            f"[VIDEO] Esperando {wait_now:.2f}s para iniciar video "
+            f"phone={session_ctx.phone_str} por actividad reciente 0x0704"
+        )
+        await asyncio.sleep(wait_now)
+        total_wait += wait_now
+        if session_ctx.closed:
+            raise RuntimeError("Sesion de video-control cerrada durante espera por 0x0704")
     result = await session_ctx.enqueue_command(
         "video-start",
         build_video_command_frames(session_ctx, channels, start_stream=True),
@@ -1100,6 +1218,7 @@ class ControlSessionContext:
         self.listen_port = listen_port
         self.created_at = utc_now_iso()
         self.last_seen_at = self.created_at
+        self.last_0704_monotonic = 0.0
         self.pending_acks = {}
         self.command_queue = asyncio.Queue()
         self.closed = False
@@ -1110,6 +1229,15 @@ class ControlSessionContext:
 
     def touch(self):
         self.last_seen_at = utc_now_iso()
+
+    def mark_batch_positions(self):
+        self.last_0704_monotonic = time.monotonic()
+
+    def remaining_0704_cooldown(self) -> float:
+        if self.last_0704_monotonic <= 0 or VIDEO_START_AFTER_0704_COOLDOWN_SECONDS <= 0:
+            return 0.0
+        remaining = (self.last_0704_monotonic + VIDEO_START_AFTER_0704_COOLDOWN_SECONDS) - time.monotonic()
+        return remaining if remaining > 0 else 0.0
 
     async def enqueue_command(self, command_name: str, frames: list[dict]):
         if self.closed:
@@ -1471,6 +1599,14 @@ def handle_0002_heartbeat(session, hdr, body):
     return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 
+def handle_0003_logout(session, hdr, body):
+    session.authenticated = False
+    session.position_seen = False
+    session.video_started = False
+    logger.info(f"[0003] Logout terminal phone={hdr['phone_str']}")
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
+
+
 def handle_0100_register(session, hdr, body):
     try:
         prov = int.from_bytes(body[0:2], "big")
@@ -1489,7 +1625,16 @@ def handle_0100_register(session, hdr, body):
         logger.exception(f"Error parseando 0x0100: {exc}")
         logger.info(f"[0100] Registro terminal phone={hdr['phone_str']} (body_len={len(body)})")
 
-    return build_0x8100(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], result=0, auth_code=b"")
+    auth_code = build_auth_code_for_phone(hdr["phone_str"])
+    ISSUED_AUTH_CODES[hdr["phone_str"]] = auth_code
+    logger.info(f"[0100] Auth code emitido para phone={hdr['phone_str']}: {auth_code!r}")
+    return build_0x8100(
+        hdr["phone_bcd"],
+        session.next_flow(),
+        hdr["flow_id"],
+        result=0,
+        auth_code=auth_code.encode("ascii", errors="ignore"),
+    )
 
 
 def handle_0102_auth(session, hdr, body):
@@ -1497,8 +1642,15 @@ def handle_0102_auth(session, hdr, body):
         token = body.decode(errors="ignore") if body else ""
     except Exception:
         token = body.hex()
+    expected_token = ISSUED_AUTH_CODES.get(hdr["phone_str"], "")
     session.authenticated = True
-    logger.info(f"[0102] Auth phone={hdr['phone_str']} token={token!r}")
+    if expected_token and token != expected_token:
+        logger.warning(
+            f"[0102] Auth phone={hdr['phone_str']} token={token!r} "
+            f"esperado={expected_token!r}"
+        )
+    else:
+        logger.info(f"[0102] Auth phone={hdr['phone_str']} token={token!r}")
     return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 
@@ -1527,12 +1679,71 @@ def handle_0200_position(session, hdr, body):
     return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
 
 
+def handle_0704_batch_positions(session, hdr, body):
+    try:
+        session.position_seen = True
+        if session.control_context is not None:
+            session.control_context.mark_batch_positions()
+        if len(body) < 3:
+            logger.warning(f"[0704] body demasiado corto: len={len(body)} phone={hdr['phone_str']}")
+            return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
+
+        count = int.from_bytes(body[0:2], "big")
+        batch_type = body[2]
+        idx = 3
+        logger.info(f"[0704] phone={hdr['phone_str']} count={count} type={batch_type}")
+
+        for i in range(count):
+            if idx + 2 > len(body):
+                logger.warning(f"[0704] sin espacio para data_len en registro {i} phone={hdr['phone_str']}")
+                break
+
+            data_len = int.from_bytes(body[idx:idx + 2], "big")
+            idx += 2
+            if idx + data_len > len(body):
+                logger.warning(
+                    f"[0704] data_len={data_len} excede body_len en registro {i} phone={hdr['phone_str']}"
+                )
+                break
+
+            data = body[idx:idx + data_len]
+            idx += data_len
+            if len(data) < 28:
+                logger.warning(
+                    f"[0704] item[{i}] demasiado corto len={len(data)} phone={hdr['phone_str']}"
+                )
+                continue
+
+            try:
+                alarm = int.from_bytes(data[0:4], "big")
+                status = int.from_bytes(data[4:8], "big")
+                lat = parse_coord_u32(data[8:12])
+                lon = parse_coord_u32(data[12:16])
+                alt = int.from_bytes(data[16:18], "big", signed=False)
+                speed = int.from_bytes(data[18:20], "big", signed=False) / 10.0
+                course = int.from_bytes(data[20:22], "big", signed=False)
+                dt = parse_time_bcd6(data[22:28])
+                logger.info(
+                    f"[0704] item[{i}] phone={hdr['phone_str']} type={batch_type} "
+                    f"alarm={alarm} status={status} lat={lat:.6f} lon={lon:.6f} "
+                    f"alt={alt}m speed={speed:.1f}km/h course={course} time={dt.isoformat()}"
+                )
+            except Exception as exc:
+                logger.exception(f"[0704] Error parseando item[{i}] phone={hdr['phone_str']}: {exc}")
+    except Exception as exc:
+        logger.exception(f"[0704] Error manejando batch phone={hdr['phone_str']}: {exc}")
+
+    return build_0x8001(hdr["phone_bcd"], session.next_flow(), hdr["flow_id"], hdr["msg_id"], 0)
+
+
 MSG_HANDLERS = {
     b"\x00\x01": handle_0001_terminal_general_resp,
     b"\x00\x02": handle_0002_heartbeat,
+    b"\x00\x03": handle_0003_logout,
     b"\x01\x00": handle_0100_register,
     b"\x01\x02": handle_0102_auth,
     b"\x02\x00": handle_0200_position,
+    b"\x07\x04": handle_0704_batch_positions,
 }
 
 
@@ -1572,14 +1783,15 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
     if not session.authenticated:
         logger.info(f"[VIDEO] Se omite start para phone={hdr['phone_str']} porque aun no termino auth")
         return
-    if not session.position_seen:
+    if AUTO_START_VIDEO_WAIT_FOR_POSITION and not session.position_seen:
         logger.info(f"[VIDEO] Esperando 0x0200 para phone={hdr['phone_str']} antes de iniciar video")
         return
 
     session.video_started = True
     phone_str = hdr["phone_str"]
     logger.info(
-        f"[VIDEO] Autoarranque habilitado para phone={phone_str} canales={AUTO_START_VIDEO_CHANNELS}"
+        f"[VIDEO] Autoarranque habilitado para phone={phone_str} canales={AUTO_START_VIDEO_CHANNELS} "
+        f"position_seen={session.position_seen}"
     )
     for ch in AUTO_START_VIDEO_CHANNELS:
         flow_9101 = session.next_flow()
