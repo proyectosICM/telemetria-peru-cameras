@@ -1113,6 +1113,23 @@ def build_video_command_frames(session_ctx: ControlSessionContext, channels: lis
                     "pause_after": 0.05,
                 }
             )
+            flow_9102 = int.from_bytes(session_ctx.session.next_flow(), "big")
+            frames.append(
+                {
+                    "frame": build_0x9102(
+                        session_ctx.phone_bcd,
+                        flow_9102.to_bytes(2, "big"),
+                        logical_channel=logical_channel,
+                        control_cmd=1,
+                        close_av_type=0,
+                        switch_stream_type=VIDEO_FRAME_TYPE,
+                    ),
+                    "flow_id_int": flow_9102,
+                    "msg_id_hex": "9102",
+                    "wait_ack": False,
+                    "pause_after": 0.05,
+                }
+            )
         else:
             flow_9102 = int.from_bytes(session_ctx.session.next_flow(), "big")
             frames.append(
@@ -1793,6 +1810,21 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
         f"[VIDEO] Autoarranque habilitado para phone={phone_str} canales={AUTO_START_VIDEO_CHANNELS} "
         f"position_seen={session.position_seen}"
     )
+    ctx = session.control_context
+    if ctx is not None and not ctx.closed:
+        try:
+            await ctx.enqueue_command(
+                "video-start-auto",
+                build_video_command_frames(ctx, AUTO_START_VIDEO_CHANNELS, start_stream=True),
+            )
+            return
+        except Exception as exc:
+            session.video_started = False
+            logger.exception(
+                f"[VIDEO] Error iniciando video por cola serial phone={phone_str}: {exc}"
+            )
+            return
+
     for ch in AUTO_START_VIDEO_CHANNELS:
         flow_9101 = session.next_flow()
         pkt_9101 = build_0x9101(
@@ -1808,6 +1840,21 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
         logger.info(f"[TX] phone={phone_str} msgId=0x9101 (StartAV ch={ch} -> {VIDEO_TARGET_IP}:{VIDEO_TCP_PORT})")
         writer.write(pkt_9101)
         await writer.drain()
+        await asyncio.sleep(0.05)
+
+        flow_9102 = session.next_flow()
+        pkt_9102 = build_0x9102(
+            hdr["phone_bcd"],
+            flow_9102,
+            logical_channel=ch,
+            control_cmd=1,
+            close_av_type=0,
+            switch_stream_type=VIDEO_FRAME_TYPE,
+        )
+        logger.info(f"[TX] phone={phone_str} msgId=0x9102 (AVControl START ch={ch})")
+        writer.write(pkt_9102)
+        await writer.drain()
+        await asyncio.sleep(0.05)
 
 
 def get_json_header(headers: dict, name: str):
