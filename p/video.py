@@ -27,14 +27,15 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 # ========== Config basica ==========
 
 HOST = "0.0.0.0"
 VIDEO_CONTROL_PORT = int(os.getenv("VIDEO_CONTROL_PORT", "7200"))
 COMMAND_CONTROL_PORT = int(os.getenv("COMMAND_CONTROL_PORT", "6808"))
-VIDEO_TCP_PORT = 7201
-VIDEO_UDP_PORT = 7201
+VIDEO_TCP_PORT = int(os.getenv("VIDEO_TCP_PORT", "7201"))
+VIDEO_UDP_PORT = int(os.getenv("VIDEO_UDP_PORT", str(VIDEO_TCP_PORT)))
 COMMAND_HTTP_PORT = int(os.getenv("COMMAND_HTTP_PORT", "7302"))
 ENABLE_VIDEO_CONTROL = os.getenv("ENABLE_VIDEO_CONTROL", "1") != "0"
 ENABLE_VIDEO_STREAM = os.getenv("ENABLE_VIDEO_STREAM", "1") != "0"
@@ -46,6 +47,12 @@ ENABLE_CONTROL_RAW_DUMP = os.getenv("ENABLE_CONTROL_RAW_DUMP") == "1"
 COMMAND_API_TOKEN = os.getenv("COMMAND_API_TOKEN", "").strip()
 COMMAND_ACK_TIMEOUT_SECONDS = float(os.getenv("COMMAND_ACK_TIMEOUT_SECONDS", "5"))
 ALARM_PARAM_ID = int(os.getenv("ALARM_PARAM_ID", "0x00FF0001"), 0)
+DVR_GPS_API_URL = os.getenv(
+    "DVR_GPS_API_URL",
+    "http://telemetria-peru-api:7070/api/vehicle-snapshots/dvr",
+).strip()
+DVR_GPS_API_TOKEN = os.getenv("DVR_GPS_API_TOKEN", "").strip()
+DVR_GPS_API_TIMEOUT_SECONDS = float(os.getenv("DVR_GPS_API_TIMEOUT_SECONDS", "2.5"))
 
 # Fallback para asociar video por peer si todavia no hay mapping mejor.
 CURRENT_PHONE = None
@@ -373,6 +380,67 @@ def parse_time_bcd6(b: bytes) -> datetime:
 
 def parse_coord_u32(raw: bytes) -> float:
     return int.from_bytes(raw, "big", signed=False) / 1_000_000.0
+
+
+def status_acc_on(status: int) -> bool:
+    return (status & 0x1) != 0
+
+
+def should_push_dvr_gps(session: "SessionState") -> bool:
+    ctx = session.control_context
+    return (
+        bool(DVR_GPS_API_URL)
+        and ctx is not None
+        and not ctx.closed
+        and ctx.listen_port == COMMAND_CONTROL_PORT
+    )
+
+
+def _post_dvr_gps_snapshot(payload: dict):
+    if not DVR_GPS_API_URL:
+        return
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if DVR_GPS_API_TOKEN:
+        headers["Authorization"] = f"Bearer {DVR_GPS_API_TOKEN}"
+    request = Request(DVR_GPS_API_URL, data=body, headers=headers, method="POST")
+    with urlopen(request, timeout=DVR_GPS_API_TIMEOUT_SECONDS) as response:
+        response.read()
+
+
+async def push_dvr_gps_snapshot(
+    session: "SessionState",
+    phone_str: str,
+    *,
+    latitude: float,
+    longitude: float,
+    speed_kmh: float,
+    ignition_status: bool,
+    alarm_status: bool,
+    timestamp_iso: str,
+):
+    if not should_push_dvr_gps(session):
+        return
+
+    payload = {
+        "dvrPhone": phone_str,
+        "latitude": f"{latitude:.6f}",
+        "longitude": f"{longitude:.6f}",
+        "speed": int(round(speed_kmh)),
+        "ignitionStatus": ignition_status,
+        "alarmStatus": alarm_status,
+        "timestamp": timestamp_iso,
+    }
+    try:
+        await asyncio.to_thread(_post_dvr_gps_snapshot, payload)
+        logger.info(
+            f"[GPS-DVR] Snapshot enviado phone={phone_str} lat={payload['latitude']} "
+            f"lon={payload['longitude']} speed={payload['speed']} registry=command-control"
+        )
+    except Exception as exc:
+        logger.warning(f"[GPS-DVR] No se pudo enviar snapshot DVR phone={phone_str}: {exc}")
 
 
 logging.basicConfig(
@@ -1690,6 +1758,19 @@ def handle_0200_position(session, hdr, body):
                 f"lat={lat:.6f} lon={lon:.6f} alt={alt}m speed={speed:.1f}km/h "
                 f"course={course} time={dt.isoformat()}"
             )
+            if should_push_dvr_gps(session):
+                asyncio.create_task(
+                    push_dvr_gps_snapshot(
+                        session,
+                        hdr["phone_str"],
+                        latitude=lat,
+                        longitude=lon,
+                        speed_kmh=speed,
+                        ignition_status=status_acc_on(status),
+                        alarm_status=alarm != 0,
+                        timestamp_iso=dt.isoformat(),
+                    )
+                )
     except Exception as exc:
         logger.exception(f"Error parseando 0x0200: {exc}")
 
@@ -1708,6 +1789,7 @@ def handle_0704_batch_positions(session, hdr, body):
         count = int.from_bytes(body[0:2], "big")
         batch_type = body[2]
         idx = 3
+        last_position_payload = None
         logger.info(f"[0704] phone={hdr['phone_str']} count={count} type={batch_type}")
 
         for i in range(count):
@@ -1745,8 +1827,24 @@ def handle_0704_batch_positions(session, hdr, body):
                     f"alarm={alarm} status={status} lat={lat:.6f} lon={lon:.6f} "
                     f"alt={alt}m speed={speed:.1f}km/h course={course} time={dt.isoformat()}"
                 )
+                last_position_payload = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "speed_kmh": speed,
+                    "ignition_status": status_acc_on(status),
+                    "alarm_status": alarm != 0,
+                    "timestamp_iso": dt.isoformat(),
+                }
             except Exception as exc:
                 logger.exception(f"[0704] Error parseando item[{i}] phone={hdr['phone_str']}: {exc}")
+        if should_push_dvr_gps(session) and last_position_payload is not None:
+            asyncio.create_task(
+                push_dvr_gps_snapshot(
+                    session,
+                    hdr["phone_str"],
+                    **last_position_payload,
+                )
+            )
     except Exception as exc:
         logger.exception(f"[0704] Error manejando batch phone={hdr['phone_str']}: {exc}")
 

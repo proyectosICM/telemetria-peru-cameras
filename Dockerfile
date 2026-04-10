@@ -14,6 +14,6 @@ COPY p/video.py ./p/video.py
 
 RUN mkdir -p /var/www/video
 
-EXPOSE 6808 7200 7201
+EXPOSE 6809 1200 1201
 
 CMD ["python", "p/video.py"]
