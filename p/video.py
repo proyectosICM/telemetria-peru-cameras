@@ -46,7 +46,6 @@ ALWAYS_ACK_UNKNOWN = True
 ENABLE_CONTROL_RAW_DUMP = os.getenv("ENABLE_CONTROL_RAW_DUMP") == "1"
 COMMAND_API_TOKEN = os.getenv("COMMAND_API_TOKEN", "").strip()
 COMMAND_ACK_TIMEOUT_SECONDS = float(os.getenv("COMMAND_ACK_TIMEOUT_SECONDS", "5"))
-VIDEO_STREAMS_BASE_URL = os.getenv("VIDEO_STREAMS_BASE_URL", "").strip().rstrip("/")
 ALARM_PARAM_ID = int(os.getenv("ALARM_PARAM_ID", "0x00FF0001"), 0)
 DVR_GPS_API_URL = os.getenv(
     "DVR_GPS_API_URL",
@@ -54,7 +53,6 @@ DVR_GPS_API_URL = os.getenv(
 ).strip()
 DVR_GPS_API_TOKEN = os.getenv("DVR_GPS_API_TOKEN", "").strip()
 DVR_GPS_API_TIMEOUT_SECONDS = float(os.getenv("DVR_GPS_API_TIMEOUT_SECONDS", "2.5"))
-ENABLE_DVR_GPS_PUSH = os.getenv("ENABLE_DVR_GPS_PUSH", "0") == "1"
 
 # Fallback para asociar video por peer si todavia no hay mapping mejor.
 CURRENT_PHONE = None
@@ -97,16 +95,14 @@ FFMPEG_BIN = "/usr/bin/ffmpeg"
 CHANNEL_IDLE_TIMEOUT_SECONDS = float(os.getenv("CHANNEL_IDLE_TIMEOUT_SECONDS", "20"))
 CHANNEL_REAPER_INTERVAL_SECONDS = float(os.getenv("CHANNEL_REAPER_INTERVAL_SECONDS", "5"))
 HLS_DRAIN_SECONDS = float(os.getenv("HLS_DRAIN_SECONDS", "1.5"))
-AUTO_START_VIDEO_RETRY_SECONDS = float(
-    os.getenv("AUTO_START_VIDEO_RETRY_SECONDS", "15")
-)
 VIDEO_START_AFTER_0704_COOLDOWN_SECONDS = float(
     os.getenv("VIDEO_START_AFTER_0704_COOLDOWN_SECONDS", "5")
 )
 VIDEO_START_AFTER_0704_MAX_WAIT_SECONDS = float(
     os.getenv("VIDEO_START_AFTER_0704_MAX_WAIT_SECONDS", "0.75")
 )
-ENABLE_VIDEO_STATUS_NOTIFY = os.getenv("ENABLE_VIDEO_STATUS_NOTIFY", "0") == "1"
+VIDEO_9208_ENABLED = os.getenv("VIDEO_9208_ENABLED", "0") == "1"
+VIDEO_9208_BODY_HEX = os.getenv("VIDEO_9208_BODY_HEX", "").strip()
 
 # Un ffmpeg por phone+canal
 FFMPEG_PROCS = {}
@@ -394,8 +390,7 @@ def status_acc_on(status: int) -> bool:
 def should_push_dvr_gps(session: "SessionState") -> bool:
     ctx = session.control_context
     return (
-        ENABLE_DVR_GPS_PUSH
-        and bool(DVR_GPS_API_URL)
+        bool(DVR_GPS_API_URL)
         and ctx is not None
         and not ctx.closed
         and ctx.listen_port == COMMAND_CONTROL_PORT
@@ -455,6 +450,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("video808")
 raw_logger = logging.getLogger("video808.raw")
+
+
+def _parse_hex_bytes_env(name: str, raw_value: str) -> bytes:
+    value = raw_value.strip().replace(" ", "")
+    if not value:
+        return b""
+    try:
+        return bytes.fromhex(value)
+    except ValueError as exc:
+        logger.warning(f"[CFG] {name} invalido; se ignorara: {exc}")
+        return b""
+
+
+VIDEO_9208_BODY = _parse_hex_bytes_env("VIDEO_9208_BODY_HEX", VIDEO_9208_BODY_HEX)
+if VIDEO_9208_ENABLED and VIDEO_9208_BODY:
+    logger.info(
+        f"[CFG] 0x9208 habilitado body_len={len(VIDEO_9208_BODY)} "
+        f"hex={VIDEO_9208_BODY.hex()}"
+    )
+elif VIDEO_9208_ENABLED:
+    logger.warning("[CFG] 0x9208 habilitado pero VIDEO_9208_BODY_HEX esta vacio; se omitira el envio")
+
+
+def get_announced_media_ports() -> tuple[int, int]:
+    tcp_port = VIDEO_TCP_PORT
+    udp_port = VIDEO_UDP_PORT if VIDEO_UDP_PORT > 0 else VIDEO_TCP_PORT
+    return tcp_port, udp_port
 
 
 def parse_header(payload: bytes):
@@ -549,6 +571,7 @@ def build_0x9101(
     frame_type: int = 0,
 ):
     ip_bytes = ip.encode("ascii")
+    announced_udp_port = udp_port if udp_port > 0 else tcp_port
     if VIDEO_COMMAND_FORMAT == "legacy":
         body = bytearray()
         body += b"\x91\x01"
@@ -567,7 +590,7 @@ def build_0x9101(
     body.append(len(ip_bytes))
     body += ip_bytes
     body += tcp_port.to_bytes(2, "big")
-    body += udp_port.to_bytes(2, "big")
+    body += announced_udp_port.to_bytes(2, "big")
     body.append(logical_channel & 0xFF)
     body.append(data_type & 0xFF)
     body.append(frame_type & 0xFF)
@@ -600,17 +623,41 @@ def build_0x9102(
     return build_downlink(b"\x91\x02", phone_bcd, flow_id_platform, bytes(body))
 
 
-def build_0x9105_av_status_notify(
+def build_0x9208_raw(
     phone_bcd: bytes,
     flow_id_platform: bytes,
-    logical_channel: int,
-    packet_loss_rate: int,
+    body: bytes,
 ):
-    pl = max(0, min(100, int(packet_loss_rate)))
+    return build_downlink(b"\x92\x08", phone_bcd, flow_id_platform, body)
+
+
+def build_0x9208_from_template(
+    phone_bcd: bytes,
+    flow_id_platform: bytes,
+    template_body: bytes,
+    ip: str,
+    tcp_port: int,
+    udp_port: int,
+):
+    if not template_body:
+        raise ValueError("Template vacio para 0x9208")
+
+    ip_bytes = ip.encode("ascii")
+    original_ip_len = template_body[0]
+    min_len = 1 + original_ip_len + 4
+    if len(template_body) < min_len:
+        raise ValueError("Template 0x9208 demasiado corto para reemplazar IP/puertos")
+
+    remainder = template_body[min_len:]
+    announced_udp_port = udp_port if udp_port > 0 else tcp_port
+
     body = bytearray()
-    body.append(logical_channel & 0xFF)
-    body.append(pl & 0xFF)
-    return build_downlink(b"\x91\x05", phone_bcd, flow_id_platform, bytes(body))
+    body.append(len(ip_bytes))
+    body += ip_bytes
+    body += tcp_port.to_bytes(2, "big")
+    body += announced_udp_port.to_bytes(2, "big")
+    body += remainder
+    return build_downlink(b"\x92\x08", phone_bcd, flow_id_platform, bytes(body))
 
 
 class SessionState:
@@ -858,8 +905,6 @@ class ChannelState:
         self.h264_started = False
         self.first_write_logged = False
         self.last_activity_monotonic = time.monotonic()
-        self.last_start_attempt_monotonic = 0.0
-        self.last_status_notify_monotonic = 0.0
         self.logged_nal_types = set()
 
     def _disable_h264_pipe(self):
@@ -887,14 +932,6 @@ class ChannelState:
 
     def touch(self):
         self.last_activity_monotonic = time.monotonic()
-
-    def mark_start_attempt(self):
-        self.last_start_attempt_monotonic = time.monotonic()
-
-    def start_attempt_recent(self) -> bool:
-        if self.last_start_attempt_monotonic <= 0 or AUTO_START_VIDEO_RETRY_SECONDS <= 0:
-            return False
-        return (time.monotonic() - self.last_start_attempt_monotonic) < AUTO_START_VIDEO_RETRY_SECONDS
 
     def close(
         self,
@@ -968,12 +1005,6 @@ class ChannelState:
             return
 
         self.touch()
-        now = time.monotonic()
-        if ENABLE_VIDEO_STATUS_NOTIFY and now - self.last_status_notify_monotonic >= 5:
-            self.last_status_notify_monotonic = now
-            asyncio.create_task(
-                notify_video_status(self.phone_str, self.channel, packet_loss_rate=0)
-            )
         self.h264_buf += chunk
         data = self.h264_buf
         out = bytearray()
@@ -1092,30 +1123,6 @@ def stop_hls_for_phone(phone_str: str, channel: int, reason: str, cleanup_output
     stop_ffmpeg_for_key(f"{phone_str}_{channel}", reason, cleanup_outputs)
 
 
-async def notify_video_status(phone_str: str, logical_channel: int, packet_loss_rate: int = 0):
-    session_ctx = await get_control_session(phone_str, registry=VIDEO_CONTROL_SESSIONS)
-    if session_ctx is None or session_ctx.closed:
-        return
-
-    flow_id = session_ctx.session.next_flow()
-    await session_ctx.enqueue_command(
-        "video-status",
-        [
-            {
-                "msg_id_hex": "9105",
-                "flow_id_int": int.from_bytes(flow_id, "big"),
-                "frame": build_0x9105_av_status_notify(
-                    session_ctx.phone_bcd,
-                    flow_id,
-                    logical_channel=logical_channel,
-                    packet_loss_rate=packet_loss_rate,
-                ),
-                "wait_ack": False,
-            }
-        ],
-    )
-
-
 def start_hls_for_phone(phone_str: str, channel: int):
     key = f"{phone_str}_{channel}"
     proc = FFMPEG_PROCS.get(key)
@@ -1169,51 +1176,10 @@ def start_hls_for_phone(phone_str: str, channel: int):
         logger.warning(f"[HLS] No se pudo lanzar ffmpeg para {key}: {exc}")
 
 
-def get_or_create_channel_state(phone_str: str | None, logical_channel: int):
-    normalized_phone = normalize_phone(phone_str)
-    if not normalized_phone or logical_channel not in VIDEO_CHANNELS:
-        return None
-    key = f"{normalized_phone}_{logical_channel}"
-    state = CHANNEL_STATES.get(key)
-    if state is None:
-        state = ChannelState(normalized_phone, logical_channel)
-        CHANNEL_STATES[key] = state
-    return state
-
-
-def filter_channels_needing_start(phone_str: str | None, channels: list[int]) -> list[int]:
-    now = time.monotonic()
-    eligible = []
-    for logical_channel in channels:
-        state = get_or_create_channel_state(phone_str, logical_channel)
-        if state is None:
-            continue
-        if state.h264_started and (now - state.last_activity_monotonic) < CHANNEL_IDLE_TIMEOUT_SECONDS:
-            logger.info(
-                f"[VIDEO] Se omite START para phone={state.phone_str} ch={logical_channel} "
-                f"porque el canal ya esta activo"
-            )
-            continue
-        if state.start_attempt_recent():
-            logger.info(
-                f"[VIDEO] Se omite START para phone={state.phone_str} ch={logical_channel} "
-                f"porque hubo un intento reciente"
-            )
-            continue
-        eligible.append(logical_channel)
-    return eligible
-
-
-def mark_video_start_attempts(phone_str: str | None, channels: list[int]):
-    for logical_channel in channels:
-        state = get_or_create_channel_state(phone_str, logical_channel)
-        if state is not None:
-            state.mark_start_attempt()
-
-
 def build_video_command_frames(session_ctx: ControlSessionContext, channels: list[int], *, start_stream: bool):
     frames = []
     action_name = "START" if start_stream else "STOP"
+    announced_tcp_port, announced_udp_port = get_announced_media_ports()
     for logical_channel in channels:
         if logical_channel not in VIDEO_CHANNELS:
             raise ValueError(f"Canal de video no permitido: {logical_channel}")
@@ -1226,8 +1192,8 @@ def build_video_command_frames(session_ctx: ControlSessionContext, channels: lis
                         session_ctx.phone_bcd,
                         flow_9101.to_bytes(2, "big"),
                         ip=VIDEO_TARGET_IP,
-                        tcp_port=VIDEO_TCP_PORT,
-                        udp_port=VIDEO_UDP_PORT,
+                        tcp_port=announced_tcp_port,
+                        udp_port=announced_udp_port,
                         logical_channel=logical_channel,
                         data_type=VIDEO_DATA_TYPE,
                         frame_type=VIDEO_FRAME_TYPE,
@@ -1236,8 +1202,55 @@ def build_video_command_frames(session_ctx: ControlSessionContext, channels: lis
                     "msg_id_hex": "9101",
                     "wait_ack": False,
                     "pause_after": 0.05,
+                    "log_hex": True,
+                    "announced_ip": VIDEO_TARGET_IP,
+                    "announced_tcp_port": announced_tcp_port,
+                    "announced_udp_port": announced_udp_port,
                 }
             )
+            flow_9102 = int.from_bytes(session_ctx.session.next_flow(), "big")
+            frames.append(
+                {
+                    "frame": build_0x9102(
+                        session_ctx.phone_bcd,
+                        flow_9102.to_bytes(2, "big"),
+                        logical_channel=logical_channel,
+                        control_cmd=1,
+                        close_av_type=0,
+                        switch_stream_type=VIDEO_FRAME_TYPE,
+                    ),
+                    "flow_id_int": flow_9102,
+                    "msg_id_hex": "9102",
+                    "wait_ack": False,
+                    "pause_after": 0.05,
+                }
+            )
+            if VIDEO_9208_ENABLED and VIDEO_9208_BODY:
+                flow_9208 = int.from_bytes(session_ctx.session.next_flow(), "big")
+                logger.info(
+                    f"[VIDEO] Preparado comando START 0x9208 para phone={session_ctx.phone_str} "
+                    f"ch={logical_channel} flow={flow_9208} body_len={len(VIDEO_9208_BODY)}"
+                )
+                frames.append(
+                    {
+                        "frame": build_0x9208_from_template(
+                            session_ctx.phone_bcd,
+                            flow_9208.to_bytes(2, "big"),
+                            VIDEO_9208_BODY,
+                            VIDEO_TARGET_IP,
+                            announced_tcp_port,
+                            announced_udp_port,
+                        ),
+                        "flow_id_int": flow_9208,
+                        "msg_id_hex": "9208",
+                        "wait_ack": False,
+                        "pause_after": 0.05,
+                        "log_hex": True,
+                        "announced_ip": VIDEO_TARGET_IP,
+                        "announced_tcp_port": announced_tcp_port,
+                        "announced_udp_port": announced_udp_port,
+                    }
+                )
         else:
             flow_9102 = int.from_bytes(session_ctx.session.next_flow(), "big")
             frames.append(
@@ -1257,7 +1270,8 @@ def build_video_command_frames(session_ctx: ControlSessionContext, channels: lis
                 }
             )
         logger.info(
-            f"[VIDEO] Preparado comando {action_name} para phone={session_ctx.phone_str} ch={logical_channel}"
+            f"[VIDEO] Preparado comando {action_name} para phone={session_ctx.phone_str} ch={logical_channel} "
+            f"media_ip={VIDEO_TARGET_IP} media_tcp={announced_tcp_port} media_udp={announced_udp_port}"
         )
     return frames
 
@@ -1266,9 +1280,6 @@ async def ensure_video_channels(phone: str | None, channels: list[int]):
     session_ctx = await get_control_session(phone, registry=VIDEO_CONTROL_SESSIONS)
     if session_ctx is None:
         raise RuntimeError("DVR sin sesion de video-control activa")
-    channels = filter_channels_needing_start(session_ctx.phone_str, channels)
-    if not channels:
-        return session_ctx, {"status": "already-active", "results": []}
     total_wait = 0.0
     while True:
         remaining_cooldown = session_ctx.remaining_0704_cooldown()
@@ -1292,7 +1303,6 @@ async def ensure_video_channels(phone: str | None, channels: list[int]):
         total_wait += wait_now
         if session_ctx.closed:
             raise RuntimeError("Sesion de video-control cerrada durante espera por 0x0704")
-    mark_video_start_attempts(session_ctx.phone_str, channels)
     result = await session_ctx.enqueue_command(
         "video-start",
         build_video_command_frames(session_ctx, channels, start_stream=True),
@@ -1428,14 +1438,31 @@ class ControlSessionContext:
             ack_future = asyncio.get_running_loop().create_future()
             self.pending_acks[ack_key] = ack_future
 
+        if frame_spec.get("log_hex"):
+            logger.info(
+                f"[CMD] preparando envio registry={self.registry_name} port={self.listen_port} "
+                f"phone={self.phone_str} msgId=0x{msg_id_hex} flow={flow_id_int} hex={frame.hex()}"
+            )
+
         self.writer.write(frame)
         await self.writer.drain()
 
-        logger.info(
+        log_msg = (
             f"[CMD] registry={self.registry_name} port={self.listen_port} "
             f"phone={self.phone_str} msgId=0x{msg_id_hex} "
             f"flow={flow_id_int} bytes={len(frame)}"
         )
+        announced_ip = frame_spec.get("announced_ip")
+        announced_tcp_port = frame_spec.get("announced_tcp_port")
+        announced_udp_port = frame_spec.get("announced_udp_port")
+        if announced_ip is not None and announced_tcp_port is not None:
+            log_msg += (
+                f" media_ip={announced_ip} media_tcp={announced_tcp_port}"
+                f" media_udp={announced_udp_port}"
+            )
+        if frame_spec.get("log_hex"):
+            log_msg += f" hex={frame.hex()}"
+        logger.info(log_msg)
 
         if not wait_ack:
             return {
@@ -1478,14 +1505,9 @@ class ControlSessionContext:
             self.worker_task.cancel()
 
 VIDEO_CONTROL_SESSIONS = {}
+COMMAND_CONTROL_SESSIONS = {}
 PEER_PHONE_INDEX = {}
 REGISTRY_LOCK = asyncio.Lock()
-
-
-def get_command_control_registry():
-    from control_commands_server import get_command_control_registry as _get_command_control_registry
-
-    return _get_command_control_registry()
 
 
 async def register_control_session(
@@ -1723,6 +1745,10 @@ def handle_0001_terminal_general_resp(session, hdr, body):
         f"[0001] Ack terminal phone={hdr['phone_str']} resp_flow={resp_flow} "
         f"resp_msgId=0x{resp_msg_id.hex()} result={result}"
     )
+    if resp_msg_id.hex() == "9208":
+        logger.info(
+            f"[9208] Ack terminal phone={hdr['phone_str']} resp_flow={resp_flow} result={result}"
+        )
     if session.control_context is not None:
         session.control_context.resolve_terminal_ack(resp_flow, resp_msg_id, result)
     return None
@@ -1951,24 +1977,18 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
         logger.info(f"[VIDEO] Esperando 0x0200 para phone={hdr['phone_str']} antes de iniciar video")
         return
 
-    phone_str = hdr["phone_str"]
-    channels_to_start = filter_channels_needing_start(phone_str, AUTO_START_VIDEO_CHANNELS)
-    if not channels_to_start:
-        session.video_started = True
-        return
-
     session.video_started = True
+    phone_str = hdr["phone_str"]
     logger.info(
-        f"[VIDEO] Autoarranque habilitado para phone={phone_str} canales={channels_to_start} "
+        f"[VIDEO] Autoarranque habilitado para phone={phone_str} canales={AUTO_START_VIDEO_CHANNELS} "
         f"position_seen={session.position_seen}"
     )
     ctx = session.control_context
     if ctx is not None and not ctx.closed:
         try:
-            mark_video_start_attempts(phone_str, channels_to_start)
             await ctx.enqueue_command(
                 "video-start-auto",
-                build_video_command_frames(ctx, channels_to_start, start_stream=True),
+                build_video_command_frames(ctx, AUTO_START_VIDEO_CHANNELS, start_stream=True),
             )
             return
         except Exception as exc:
@@ -1978,8 +1998,7 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
             )
             return
 
-    mark_video_start_attempts(phone_str, channels_to_start)
-    for ch in channels_to_start:
+    for ch in AUTO_START_VIDEO_CHANNELS:
         flow_9101 = session.next_flow()
         pkt_9101 = build_0x9101(
             hdr["phone_bcd"],
@@ -1995,6 +2014,10 @@ async def start_video_if_needed(session: SessionState, hdr, writer):
         writer.write(pkt_9101)
         await writer.drain()
         await asyncio.sleep(0.05)
+        logger.info(
+            f"[VIDEO] StartAV enviado para phone={phone_str} ch={ch}; "
+            f"no se enviara 0x9102 automatico en autoarranque"
+        )
 
 
 def get_json_header(headers: dict, name: str):
@@ -2022,49 +2045,6 @@ async def write_http_response(writer: asyncio.StreamWriter, status_code: int, pa
     ]
     writer.write("\r\n".join(headers).encode("ascii") + body)
     await writer.drain()
-
-
-def _proxy_video_http_request(method: str, path: str, body: bytes):
-    if not VIDEO_STREAMS_BASE_URL:
-        raise RuntimeError("VIDEO_STREAMS_BASE_URL no configurado")
-
-    headers = {
-        "Content-Type": "application/json",
-    }
-    if COMMAND_API_TOKEN:
-        headers["Authorization"] = f"Bearer {COMMAND_API_TOKEN}"
-
-    request = Request(
-        VIDEO_STREAMS_BASE_URL + path,
-        data=body if method == "POST" else None,
-        headers=headers,
-        method=method,
-    )
-    with urlopen(request, timeout=5) as response:
-        status_code = getattr(response, "status", 200)
-        response_body = response.read()
-    return status_code, response_body
-
-
-async def proxy_video_http_request(writer: asyncio.StreamWriter, method: str, path: str, body: bytes):
-    try:
-        status_code, response_body = await asyncio.to_thread(
-            _proxy_video_http_request,
-            method,
-            path,
-            body,
-        )
-        response_payload = json.loads(response_body.decode("utf-8") or "{}")
-        await write_http_response(writer, status_code, response_payload)
-    except Exception as exc:
-        await write_http_response(
-            writer,
-            502,
-            {
-                "error": f"No se pudo comunicar con video-service: {exc}",
-                "path": path,
-            },
-        )
 
 
 def authorize_http_request(headers: dict):
@@ -2126,14 +2106,11 @@ async def handle_command_http_client(reader: asyncio.StreamReader, writer: async
 
         if method == "GET" and parsed.path == "/dvr-alerts":
             phone = query.get("phone", [None])[0]
-            session_ctx = await get_control_session(phone, registry=get_command_control_registry())
+            session_ctx = await get_control_session(phone, registry=COMMAND_CONTROL_SESSIONS)
             await write_http_response(writer, 200, build_catalog_response(phone, session_ctx))
             return
 
         if method == "POST" and parsed.path == "/video-streams/ensure":
-            if not ENABLE_VIDEO_CONTROL:
-                await proxy_video_http_request(writer, method, parsed.path, body)
-                return
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
             except Exception:
@@ -2184,9 +2161,6 @@ async def handle_command_http_client(reader: asyncio.StreamReader, writer: async
             return
 
         if method == "POST" and parsed.path == "/video-streams/stop":
-            if not ENABLE_VIDEO_CONTROL:
-                await proxy_video_http_request(writer, method, parsed.path, body)
-                return
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
             except Exception:
@@ -2253,7 +2227,7 @@ async def handle_command_http_client(reader: asyncio.StreamReader, writer: async
                 await write_http_response(writer, 400, {"error": "phone y alertCode son obligatorios"})
                 return
 
-            session_ctx = await get_control_session(phone, registry=get_command_control_registry())
+            session_ctx = await get_control_session(phone, registry=COMMAND_CONTROL_SESSIONS)
             if session_ctx is None:
                 await write_http_response(
                     writer,
@@ -2506,7 +2480,13 @@ async def handle_control_client(
 
 async def handle_video_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
-    logger.info(f"[VID] Nueva conexion de VIDEO en puerto {VIDEO_TCP_PORT} desde {peer}")
+    started_monotonic = time.monotonic()
+    announced_tcp_port, announced_udp_port = get_announced_media_ports()
+    logger.info(
+        f"[VID] Nueva conexion de VIDEO en puerto {VIDEO_TCP_PORT} desde {peer} "
+        f"announced_media_ip={VIDEO_TARGET_IP} announced_media_tcp={announced_tcp_port} "
+        f"announced_media_udp={announced_udp_port}"
+    )
     session = SessionState()
 
     try:
@@ -2517,9 +2497,26 @@ async def handle_video_stream(reader: asyncio.StreamReader, writer: asyncio.Stre
 
             session.feed_jt1078(chunk)
 
+        elapsed_seconds = time.monotonic() - started_monotonic
+        logger.info(
+            f"[VID] Fin de lectura en puerto {VIDEO_TCP_PORT} peer={peer} "
+            f"phone={session.phone_str} jt1078_packets={session.jt1078_packet_count} "
+            f"elapsed={elapsed_seconds:.3f}s"
+        )
+
     except Exception as exc:
         logger.exception(f"[VID] Error en conexion de video {peer}: {exc}")
     finally:
+        elapsed_seconds = time.monotonic() - started_monotonic
+        logger.info(
+            f"[VID] Resumen sesion VIDEO peer={peer} phone={session.phone_str} "
+            f"jt1078_packets={session.jt1078_packet_count} "
+            f"first_chunk_logged={session.first_video_chunk_logged} "
+            f"elapsed={elapsed_seconds:.3f}s "
+            f"announced_media_ip={VIDEO_TARGET_IP} "
+            f"announced_media_tcp={announced_tcp_port} "
+            f"announced_media_udp={announced_udp_port}"
+        )
         try:
             session.close_all_pipes()
         except Exception:
@@ -2530,7 +2527,10 @@ async def handle_video_stream(reader: asyncio.StreamReader, writer: asyncio.Stre
             await writer.wait_closed()
         except Exception:
             pass
-        logger.info(f"[VID] Conexion de VIDEO cerrada {peer} (phone={session.phone_str})")
+        logger.info(
+            f"[VID] Conexion de VIDEO cerrada {peer} "
+            f"(phone={session.phone_str}, elapsed={elapsed_seconds:.3f}s)"
+        )
 
 
 async def create_video_control_server():
@@ -2548,6 +2548,23 @@ async def create_video_control_server():
         ),
         HOST,
         VIDEO_CONTROL_PORT,
+    )
+
+
+async def create_command_control_server():
+    if not ENABLE_COMMAND_CONTROL:
+        return None
+    return await asyncio.start_server(
+        lambda reader, writer: handle_control_client(
+            reader,
+            writer,
+            registry_name="command-control",
+            registry=COMMAND_CONTROL_SESSIONS,
+            listen_port=COMMAND_CONTROL_PORT,
+            start_video_on_auth=False,
+        ),
+        HOST,
+        COMMAND_CONTROL_PORT,
     )
 
 
@@ -2572,12 +2589,10 @@ def log_server_status(name: str, server):
 
 
 async def main():
-    from control_commands_server import start_control_commands_server
-
     reaper_task = asyncio.create_task(reap_idle_channels(), name="channel-reaper")
     video_control_server = await create_video_control_server()
     video_server = await create_video_stream_server()
-    command_control_server = await start_control_commands_server()
+    command_control_server = await create_command_control_server()
     command_server = await create_command_http_server()
 
     log_server_status("Servidor CONTROL VIDEO JT808", video_control_server)
