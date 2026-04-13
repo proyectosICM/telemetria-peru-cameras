@@ -294,7 +294,7 @@ JT1078_LOGICAL_CHANNEL_OFFSET = 14
 JT1078_DATA_TYPE_OFFSET = 15
 JT1078_BODY_LEN_OFFSET = 28
 JT1078_BODY_OFFSET = JT1078_BODY_LEN_OFFSET + 2
-JT1078_MAX_BODY_LEN = int(os.getenv("JT1078_MAX_BODY_LEN", "2048"))
+JT1078_MAX_BODY_LEN = int(os.getenv("JT1078_MAX_BODY_LEN", "8192"))
 
 
 def utc_now_iso() -> str:
@@ -674,6 +674,9 @@ class SessionState:
         self.first_video_chunk_logged = False
         self.jt1078_packet_count = 0
         self.jt1078_reassembly = {}
+        self.media_connected = False
+        self.last_media_packet = 0.0
+        self.media_started = False
 
     def next_flow(self) -> bytes:
         return self.flow.next()
@@ -829,10 +832,12 @@ class SessionState:
                 return
 
             if buf[0:4] != JT1078_MAGIC:
+                # No descartar agresivamente: puede llegar handshake previo al stream.
+                if not self.first_video_chunk_logged:
+                    logger.info(f"[MEDIA] Data no-JT1078 detectada (posible handshake) len={len(buf)}")
                 idx = buf.find(JT1078_MAGIC, 1)
                 if idx == -1:
-                    logger.warning(f"[JT1078] No se encontro magic en {len(buf)} bytes, descartando todo menos ultimos 3.")
-                    self.jt1078_buf = buf[-3:]
+                    self.jt1078_buf = buf[-64:]
                     return
                 logger.warning(f"[JT1078] Basura antes de magic, descartando {idx} bytes.")
                 self.jt1078_buf = buf[idx:]
@@ -867,6 +872,9 @@ class SessionState:
                 continue
             self.jt1078_buf = buf[total_len:]
             self.jt1078_packet_count += 1
+            if not self.media_started:
+                self.media_started = True
+                logger.info(f"[MEDIA] Primer paquete JT1078 valido recibido phone={self.phone_str}")
 
             if self.jt1078_packet_count <= 12:
                 logger.info(
@@ -1049,19 +1057,17 @@ class ChannelState:
                         f"[H264] IDR detectado phone={self.phone_str} ch={self.channel} "
                         f"(nal_type=5), sps_seen={self.sps_seen} pps_seen={self.pps_seen}"
                     )
-                    if self.sps_seen and self.pps_seen:
-                        self.idr_started = True
-                        self.h264_started = True
-                        logger.info(
-                            f"[H264] Arrancando stream bueno para phone={self.phone_str} "
-                            f"ch={self.channel} (SPS+PPS+IDR)"
-                        )
-                        start_hls_for_phone(self.phone_str, self.channel)
-                        if self.last_sps:
-                            out += self.last_sps
-                        if self.last_pps:
-                            out += self.last_pps
-                        out += nalu
+                    self.idr_started = True
+                    self.h264_started = True
+                    logger.info(
+                        f"[H264] Stream iniciado (modo tolerante) phone={self.phone_str} ch={self.channel}"
+                    )
+                    start_hls_for_phone(self.phone_str, self.channel)
+                    if self.last_sps:
+                        out += self.last_sps
+                    if self.last_pps:
+                        out += self.last_pps
+                    out += nalu
             else:
                 if 1 <= nal_type <= 23:
                     out += nalu
@@ -1251,6 +1257,10 @@ def build_video_command_frames(session_ctx: ControlSessionContext, channels: lis
                         "announced_udp_port": announced_udp_port,
                     }
                 )
+                logger.info(
+                    f"[9208] STREAM solicitado phone={session_ctx.phone_str} ch={logical_channel} "
+                    f"esperando conexion de media..."
+                )
         else:
             flow_9102 = int.from_bytes(session_ctx.session.next_flow(), "big")
             frames.append(
@@ -1328,6 +1338,11 @@ async def reap_idle_channels():
         await asyncio.sleep(CHANNEL_REAPER_INTERVAL_SECONDS)
         now = time.monotonic()
         for key, state in list(CHANNEL_STATES.items()):
+            if hasattr(state, "phone_str"):
+                logger.debug(
+                    f"[DEBUG] Checking channel {state.phone_str}_{state.channel} "
+                    f"idle={now - state.last_activity_monotonic:.2f}s"
+                )
             if now - state.last_activity_monotonic <= CHANNEL_IDLE_TIMEOUT_SECONDS:
                 continue
             logger.info(
@@ -2495,6 +2510,10 @@ async def handle_video_stream(reader: asyncio.StreamReader, writer: asyncio.Stre
             if not chunk:
                 break
 
+            session.last_media_packet = time.monotonic()
+            if not session.media_connected:
+                session.media_connected = True
+                logger.info(f"[MEDIA] Conexion de media ACTIVADA peer={peer}")
             session.feed_jt1078(chunk)
 
         elapsed_seconds = time.monotonic() - started_monotonic
