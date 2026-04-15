@@ -749,10 +749,9 @@ class SessionState:
             if ch_state is None:
                 continue
             logger.info(
-                f"[JT1078] Flush final de reensamblado pendiente "
+                f"[JT1078] Reensamblado incompleto al cierre, descartando "
                 f"phone={self.phone_str} ch={logical_channel} bytes={len(pending)}"
             )
-            ch_state.feed_h264(bytes(pending))
         for st in self.channels.values():
             try:
                 st.feed_h264(b"", final=True)
@@ -781,21 +780,40 @@ class SessionState:
         key = f"{self.phone_str}_{logical_channel}"
         if sub_flag == 0:
             self.jt1078_reassembly.pop(key, None)
+            if self.jt1078_packet_count <= 20:
+                logger.info(
+                    f"[JT1078-ASM] ch={logical_channel} sub=0 single_len={len(payload)}"
+                )
             return payload
 
         buf = self.jt1078_reassembly.setdefault(key, bytearray())
         if sub_flag == 1:
             buf.clear()
             buf += payload
+            if self.jt1078_packet_count <= 20:
+                logger.info(
+                    f"[JT1078-ASM] ch={logical_channel} sub=1 start_len={len(payload)} total={len(buf)}"
+                )
             return None
         if sub_flag == 3:
             buf += payload
+            if self.jt1078_packet_count <= 20:
+                logger.info(
+                    f"[JT1078-ASM] ch={logical_channel} sub=3 append_len={len(payload)} total={len(buf)}"
+                )
             return None
         if sub_flag == 2:
             buf += payload
             out = bytes(buf)
             buf.clear()
+            if self.jt1078_packet_count <= 20:
+                logger.info(
+                    f"[JT1078-ASM] ch={logical_channel} sub=2 end_len={len(payload)} total={len(out)}"
+                )
             return out
+        logger.warning(
+            f"[JT1078-ASM] ch={logical_channel} sub_flag desconocido={sub_flag} len={len(payload)}"
+        )
         return payload
 
     def extract_jt1078_body(self, packet: bytes) -> tuple[bytes | None, int | None]:
@@ -876,7 +894,7 @@ class SessionState:
                 self.media_started = True
                 logger.info(f"[MEDIA] Primer paquete JT1078 valido recibido phone={self.phone_str}")
 
-            if self.jt1078_packet_count <= 12:
+            if self.jt1078_packet_count <= 20:
                 logger.info(
                     f"[JT1078] pkt#{self.jt1078_packet_count} ch={logical_channel} "
                     f"data_type={data_type} sub_flag={sub_flag} body_len={len(body)}"
@@ -889,7 +907,7 @@ class SessionState:
                     if payload:
                         ch_state.feed_h264(payload)
             else:
-                if self.jt1078_packet_count <= 12:
+                if self.jt1078_packet_count <= 20:
                     logger.info(
                         f"[JT1078] pkt#{self.jt1078_packet_count} tipo no-video "
                         f"(ch={logical_channel} data_type={data_type}), ignorado."
