@@ -33,7 +33,8 @@ from urllib.request import Request, urlopen
 
 HOST = "0.0.0.0"
 VIDEO_CONTROL_PORT = int(os.getenv("VIDEO_CONTROL_PORT", "7200"))
-COMMAND_CONTROL_PORT = int(os.getenv("COMMAND_CONTROL_PORT", "6808"))
+#COMMAND_CONTROL_PORT = int(os.getenv("COMMAND_CONTROL_PORT", "6808"))
+COMMAND_CONTROL_PORT = int(os.getenv("COMMAND_CONTROL_PORT", "1009"))
 VIDEO_TCP_PORT = int(os.getenv("VIDEO_TCP_PORT", "7201"))
 VIDEO_UDP_PORT = int(os.getenv("VIDEO_UDP_PORT", str(VIDEO_TCP_PORT)))
 COMMAND_HTTP_PORT = int(os.getenv("COMMAND_HTTP_PORT", "7302"))
